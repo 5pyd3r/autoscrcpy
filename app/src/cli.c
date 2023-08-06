@@ -72,10 +72,7 @@ enum {
     OPT_REQUIRE_AUDIO,
     OPT_AUDIO_BUFFER,
     OPT_AUDIO_OUTPUT_BUFFER,
-    OPT_NO_DISPLAY,
     OPT_NO_VIDEO,
-    OPT_NO_AUDIO_PLAYBACK,
-    OPT_NO_VIDEO_PLAYBACK,
     OPT_AUDIO_SOURCE,
     OPT_KILL_ADB_ON_CLOSE,
     OPT_TIME_LIMIT,
@@ -434,11 +431,6 @@ static const struct sc_option options[] = {
         .longopt_id = OPT_NO_VIDEO,
         .longopt = "no-video",
         .text = "Disable video forwarding.",
-    },
-    {
-        .longopt_id = OPT_NO_VIDEO_PLAYBACK,
-        .longopt = "no-video-playback",
-        .text = "Disable video playback on the computer.",
     },
     {
         .longopt_id = OPT_OTG,
@@ -1730,19 +1722,6 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                 break;
             case 'n':
                 opts->control = false;
-                break;
-            case OPT_NO_DISPLAY:
-                LOGW("--no-display is deprecated, use --no-playback instead.");
-                // fall through
-            case 'N':
-                opts->video_playback = false;
-                opts->audio_playback = false;
-                break;
-            case OPT_NO_VIDEO_PLAYBACK:
-                opts->video_playback = false;
-                break;
-            case OPT_NO_AUDIO_PLAYBACK:
-                opts->audio_playback = false;
                 break;
             case 'p':
                 if (!parse_port_range(optarg, &opts->port_range)) {

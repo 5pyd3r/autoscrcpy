@@ -407,21 +407,6 @@ scrcpy(struct scrcpy_options *options) {
     assert(!options->video_playback || options->video);
     assert(!options->audio_playback || options->audio);
 
-    if (options->video_playback) {
-        sdl_set_hints(options->render_driver);
-        if (SDL_Init(SDL_INIT_VIDEO)) {
-            LOGE("Could not initialize SDL video: %s", SDL_GetError());
-            goto end;
-        }
-    }
-
-    if (options->audio_playback) {
-        if (SDL_Init(SDL_INIT_AUDIO)) {
-            LOGE("Could not initialize SDL audio: %s", SDL_GetError());
-            goto end;
-        }
-    }
-
     sdl_configure(options->video_playback, options->disable_screensaver);
 
     // Await for server without blocking Ctrl+C handling
@@ -475,21 +460,9 @@ scrcpy(struct scrcpy_options *options) {
                         &audio_demuxer_cbs, options);
     }
 
-    bool needs_video_decoder = options->video_playback;
-    bool needs_audio_decoder = options->audio_playback;
 #ifdef HAVE_V4L2
     needs_video_decoder |= !!options->v4l2_device;
 #endif
-    if (needs_video_decoder) {
-        sc_decoder_init(&s->video_decoder, "video");
-        sc_packet_source_add_sink(&s->video_demuxer.packet_source,
-                                  &s->video_decoder.packet_sink);
-    }
-    if (needs_audio_decoder) {
-        sc_decoder_init(&s->audio_decoder, "audio");
-        sc_packet_source_add_sink(&s->audio_demuxer.packet_source,
-                                  &s->audio_decoder.packet_sink);
-    }
 
     if (options->record_filename) {
         static const struct sc_recorder_callbacks recorder_cbs = {
@@ -660,55 +633,6 @@ aoa_hid_end:
 
     // There is a controller if and only if control is enabled
     assert(options->control == !!controller);
-
-    if (options->video_playback) {
-        const char *window_title =
-            options->window_title ? options->window_title : info->device_name;
-
-        struct sc_screen_params screen_params = {
-            .controller = controller,
-            .fp = fp,
-            .kp = kp,
-            .mp = mp,
-            .forward_all_clicks = options->forward_all_clicks,
-            .legacy_paste = options->legacy_paste,
-            .clipboard_autosync = options->clipboard_autosync,
-            .shortcut_mods = &options->shortcut_mods,
-            .window_title = window_title,
-            .always_on_top = options->always_on_top,
-            .window_x = options->window_x,
-            .window_y = options->window_y,
-            .window_width = options->window_width,
-            .window_height = options->window_height,
-            .window_borderless = options->window_borderless,
-            .rotation = options->rotation,
-            .mipmaps = options->mipmaps,
-            .fullscreen = options->fullscreen,
-            .start_fps_counter = options->start_fps_counter,
-        };
-
-        struct sc_frame_source *src = &s->video_decoder.frame_source;
-        if (options->display_buffer) {
-            sc_delay_buffer_init(&s->display_buffer, options->display_buffer,
-                                 true);
-            sc_frame_source_add_sink(src, &s->display_buffer.frame_sink);
-            src = &s->display_buffer.frame_source;
-        }
-
-        if (!sc_screen_init(&s->screen, &screen_params)) {
-            goto end;
-        }
-        screen_initialized = true;
-
-        sc_frame_source_add_sink(src, &s->screen.frame_sink);
-    }
-
-    if (options->audio_playback) {
-        sc_audio_player_init(&s->audio_player, options->audio_buffer,
-                             options->audio_output_buffer);
-        sc_frame_source_add_sink(&s->audio_decoder.frame_source,
-                                 &s->audio_player.frame_sink);
-    }
 
 #ifdef HAVE_V4L2
     if (options->v4l2_device) {
