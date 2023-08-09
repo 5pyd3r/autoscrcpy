@@ -460,10 +460,6 @@ scrcpy(struct scrcpy_options *options) {
                         &audio_demuxer_cbs, options);
     }
 
-#ifdef HAVE_V4L2
-    needs_video_decoder |= !!options->v4l2_device;
-#endif
-
     if (options->record_filename) {
         static const struct sc_recorder_callbacks recorder_cbs = {
             .on_ended = sc_recorder_on_ended,

@@ -377,11 +377,6 @@ static const struct sc_option options[] = {
         .text = "Disable audio forwarding.",
     },
     {
-        .longopt_id = OPT_NO_AUDIO_PLAYBACK,
-        .longopt = "no-audio-playback",
-        .text = "Disable audio playback on the computer.",
-    },
-    {
         .longopt_id = OPT_NO_CLEANUP,
         .longopt = "no-cleanup",
         .text = "By default, scrcpy removes the server binary from the device "
@@ -404,11 +399,6 @@ static const struct sc_option options[] = {
         .text = "By default, on MediaCodec error, scrcpy automatically tries "
                 "again with a lower definition.\n"
                 "This option disables this behavior.",
-    },
-    {
-        // deprecated
-        .longopt_id = OPT_NO_DISPLAY,
-        .longopt = "no-display",
     },
     {
         .longopt_id = OPT_NO_KEY_REPEAT,
