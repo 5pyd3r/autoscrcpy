@@ -73,9 +73,28 @@ adb_connection_t *adb_connect(const char *host, uint16_t port) {
     conn->next_local_id = 1;
     conn->max_payload = ADB_MAX_PAYLOAD;
 
-    /* Start authentication */
+    /* Start authentication - send CNXN */
     session_start_auth(conn);
 
+    /* Wait for response (CNXN or AUTH) */
+    int retries = 100;
+    while (conn->state == ADB_STATE_CONNECTING && retries > 0) {
+        int r = session_poll(conn, 100);
+        if (r < 0) {
+            log_error("Connection failed during handshake");
+            adb_disconnect(conn);
+            return NULL;
+        }
+        retries--;
+    }
+
+    if (conn->state != ADB_STATE_CONNECTED) {
+        log_error("ADB handshake failed, state=%d", conn->state);
+        adb_disconnect(conn);
+        return NULL;
+    }
+
+    log_info("ADB connected to %s:%u", host, port);
     return conn;
 }
 

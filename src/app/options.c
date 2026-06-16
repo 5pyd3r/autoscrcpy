@@ -2,7 +2,7 @@
 
 const struct scrcpy_options scrcpy_options_default = {
     .serial = NULL,
-    .server_path = "scrcpy-server.jar",
+    .server_path = "C:/Users/Spyder/Downloads/scrcpy-win64-v3.3.2/scrcpy-server",
     .record_filename = NULL,
     .window_title = "AutoScrcpy",
     .port = 5555,

@@ -98,6 +98,7 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
         return false;
     }
 
+    /* Initialize window */
     if (!window_init(&app->window, GetModuleHandle(NULL), options->window_title,
                      800, 600)) {
         log_error("Failed to initialize window");
@@ -113,16 +114,19 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
     };
     window_set_callbacks(&app->window, &cbs);
 
+    /* Initialize D3D context */
     if (!d3d_context_init(&app->d3d_ctx, app->window.hwnd, 800, 600)) {
         log_error("Failed to initialize D3D context");
         return false;
     }
 
+    /* Initialize video renderer */
     if (!video_renderer_init(&app->renderer, &app->d3d_ctx)) {
         log_error("Failed to initialize video renderer");
         return false;
     }
 
+    /* Create decoders */
     app->video_decoder = video_decoder_create();
     if (!app->video_decoder) {
         log_error("Failed to create video decoder");
@@ -135,11 +139,17 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
         return false;
     }
 
+    /* Create stop event */
     app->stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (!app->stop_event) {
         log_error("Failed to create stop event");
         return false;
     }
+
+    /* Initialize sockets to invalid */
+    app->video_sock.fd = INVALID_SOCKFD;
+    app->audio_sock.fd = INVALID_SOCKFD;
+    app->control_sock.fd = INVALID_SOCKFD;
 
     return true;
 }
@@ -211,19 +221,58 @@ int application_run(application_t *app) {
 }
 
 void application_destroy(application_t *app) {
-    if (app->stop_event) CloseHandle(app->stop_event);
-    if (app->video_decoder) video_decoder_destroy(app->video_decoder);
-    if (app->audio_decoder) audio_decoder_destroy(app->audio_decoder);
+    log_info("Cleaning up application...");
 
-    video_renderer_destroy(&app->renderer);
-    d3d_context_destroy(&app->d3d_ctx);
-    window_destroy(&app->window);
+    if (app->stop_event) {
+        CloseHandle(app->stop_event);
+        app->stop_event = NULL;
+    }
 
-    video_socket_destroy(&app->video_sock);
-    audio_socket_destroy(&app->audio_sock);
-    control_socket_destroy(&app->control_sock);
+    if (app->video_decoder) {
+        video_decoder_destroy(app->video_decoder);
+        app->video_decoder = NULL;
+    }
+
+    if (app->audio_decoder) {
+        audio_decoder_destroy(app->audio_decoder);
+        app->audio_decoder = NULL;
+    }
+
+    /* Skip renderer cleanup for now */
+    /* if (app->renderer.d3d_ctx) {
+        video_renderer_destroy(&app->renderer);
+        app->renderer.d3d_ctx = NULL;
+    } */
+
+    /* Skip D3D context cleanup for now */
+    /* if (app->d3d_ctx.device) {
+        d3d_context_destroy(&app->d3d_ctx);
+        app->d3d_ctx.device = NULL;
+    } */
+
+    /* Skip window cleanup for now */
+    /* if (app->window.hwnd) {
+        window_destroy(&app->window);
+        app->window.hwnd = NULL;
+    } */
+
+    if (app->video_sock.fd != INVALID_SOCKFD) {
+        video_socket_destroy(&app->video_sock);
+        app->video_sock.fd = INVALID_SOCKFD;
+    }
+
+    if (app->audio_sock.fd != INVALID_SOCKFD) {
+        audio_socket_destroy(&app->audio_sock);
+        app->audio_sock.fd = INVALID_SOCKFD;
+    }
+
+    if (app->control_sock.fd != INVALID_SOCKFD) {
+        control_socket_destroy(&app->control_sock);
+        app->control_sock.fd = INVALID_SOCKFD;
+    }
 
     adb_destroy();
+    log_info("Application cleanup complete");
 }
 
 static void on_key_event(uint32_t vk, bool down, void *userdata) {

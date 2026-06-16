@@ -60,6 +60,12 @@ bool cli_parse(int argc, char *argv[], struct scrcpy_options *options) {
             options->stay_awake = true;
         } else if (strcmp(argv[i], "--show-touches") == 0) {
             options->show_touches = true;
+        } else if (strcmp(argv[i], "--server-path") == 0) {
+            if (i + 1 >= argc) {
+                log_error("Missing server path");
+                return false;
+            }
+            options->server_path = argv[++i];
         } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--record") == 0) {
             if (i + 1 >= argc) {
                 log_error("Missing record filename");
