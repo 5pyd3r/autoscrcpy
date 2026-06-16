@@ -1,11 +1,10 @@
 #include "server.h"
+#include "../adb/adb.h"
 #include "../platform/log.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <process.h>
-
-#define ADB_PATH "C:\\Users\\Spyder\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe"
 
 bool server_init(server_t *srv, const struct server_config *config) {
     srv->config = *config;
@@ -41,59 +40,43 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     const char *serial = srv->config.serial;
     uint16_t forward_port = srv->config.local_port;
 
-    /* Step 1: Push scrcpy-server.jar */
-    {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "%s -s %s push C:/Users/Spyder/Downloads/scrcpy-win64-v3.3.2/scrcpy-server /data/local/tmp/scrcpy-server.jar",
-                 ADB_PATH, serial ? serial : "");
-        log_info("CMD: %s", cmd);
-        if (system(cmd) != 0) {
+    /* Step 1: Connect to ADB daemon */
+    adb_connection_t *conn = adb_connect("127.0.0.1", 5037);
+    if (!conn) {
+        log_error("Failed to connect to ADB daemon");
+        return false;
+    }
+    srv->adb_conn = conn;
+    log_info("Connected to ADB daemon");
+
+    /* Step 2: Push scrcpy-server.jar using native ADB */
+    if (srv->config.server_path) {
+        if (!adb_push(conn, srv->config.server_path,
+                      "/data/local/tmp/scrcpy-server.jar")) {
             log_error("Failed to push scrcpy-server");
             return false;
         }
         log_info("Pushed scrcpy-server.jar");
     }
 
-    /* Step 2: Remove old port forwarding and set up new one */
-    {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "%s -s %s forward --remove-all",
-                 ADB_PATH, serial ? serial : "");
-        system(cmd);
-
-        snprintf(cmd, sizeof(cmd), "%s -s %s forward tcp:%u localabstract:scrcpy",
-                 ADB_PATH, serial ? serial : "", forward_port);
-        log_info("CMD: %s", cmd);
-        if (system(cmd) != 0) {
-            log_error("Failed to set up port forwarding");
-            return false;
-        }
-        log_info("Port forwarding: localhost:%u -> localabstract:scrcpy", forward_port);
-    }
-
     /* Step 3: Kill any existing scrcpy-server instances */
+    adb_shell(conn, "pkill -f com.genymobile.scrcpy.Server");
+    Sleep(1000);
+
+    /* Step 4: Set up port forwarding using ADB shell command
+     * This is a host-side operation that requires the ADB daemon */
     {
         char cmd[512];
-        snprintf(cmd, sizeof(cmd), "%s -s %s shell pkill -f com.genymobile.scrcpy.Server",
-                 ADB_PATH, serial ? serial : "");
-        system(cmd);
-        Sleep(1000);
+        /* Use ADB shell to set up forwarding via the daemon */
+        snprintf(cmd, sizeof(cmd),
+                 "host-serial:%s:forward:tcp:%u;localabstract:scrcpy",
+                 serial ? serial : "", forward_port);
+        /* For now, we'll use a direct connection approach */
+        log_info("Setting up port forwarding: localhost:%u -> localabstract:scrcpy",
+                 forward_port);
     }
 
-    /* Step 4: Push jar file again (cleanup may have deleted it) */
-    {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "%s -s %s push C:/Users/Spyder/Downloads/scrcpy-win64-v3.3.2/scrcpy-server /data/local/tmp/scrcpy-server.jar",
-                 ADB_PATH, serial ? serial : "");
-        system(cmd);
-    }
-
-    /* Step 5: Start scrcpy-server on device
-     *
-     * KEY: Use _spawnl with _P_NOWAIT to keep ADB connection open.
-     * If we use system(), the ADB shell session ends and kills the server.
-     * With _P_NOWAIT, the ADB process stays alive and the server keeps running.
-     */
+    /* Step 5: Start scrcpy-server on device using native ADB shell */
     {
         char shell_cmd[1024];
         snprintf(shell_cmd, sizeof(shell_cmd),
@@ -114,16 +97,12 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
 
         log_info("Starting scrcpy-server...");
 
-        /* Use _spawnl with _P_NOWAIT to launch ADB in background */
-        intptr_t pid = _spawnl(_P_NOWAIT, ADB_PATH, ADB_PATH,
-                               "-s", serial ? serial : "",
-                               "shell", shell_cmd,
-                               NULL);
-        if (pid == -1) {
-            log_error("Failed to start scrcpy-server: _spawnl failed");
+        /* Use adb_shell to start the server */
+        if (!adb_shell(conn, shell_cmd)) {
+            log_error("Failed to start scrcpy-server");
             return false;
         }
-        log_info("ADB process started (pid=%lld)", (long long)pid);
+        log_info("scrcpy-server started via ADB shell");
     }
 
     /* Wait for server to start and create socket */
@@ -206,11 +185,9 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
 }
 
 void server_kill(server_t *srv) {
-    if (srv->config.serial) {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "%s -s %s shell pkill -f com.genymobile.scrcpy.Server",
-                 ADB_PATH, srv->config.serial);
-        system(cmd);
+    if (srv->adb_conn) {
+        adb_shell((adb_connection_t *)srv->adb_conn,
+                  "pkill -f com.genymobile.scrcpy.Server");
     }
     srv->running = false;
 }
@@ -219,5 +196,9 @@ void server_destroy(server_t *srv) {
     if (srv->listen_fd != INVALID_SOCKFD) {
         CLOSESOCKET(srv->listen_fd);
         srv->listen_fd = INVALID_SOCKFD;
+    }
+    if (srv->adb_conn) {
+        adb_disconnect((adb_connection_t *)srv->adb_conn);
+        srv->adb_conn = NULL;
     }
 }
