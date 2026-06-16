@@ -1,9 +1,14 @@
 #ifndef PLATFORM_H
 #define PLATFORM_H
 
+#include <stdint.h>
+
 #ifdef _WIN32
     #ifndef _WIN32_WINNT
         #define _WIN32_WINNT 0x0600
+    #endif
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
     #endif
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -34,6 +39,9 @@
     static inline void platform_cleanup(void) {
         WSACleanup();
     }
+    static inline void platform_sleep_ms(uint32_t ms) {
+        Sleep(ms);
+    }
 #else
     #include <sys/types.h>
     #include <sys/socket.h>
@@ -62,6 +70,9 @@
 
     static inline int platform_init(void) { return 0; }
     static inline void platform_cleanup(void) {}
+    static inline void platform_sleep_ms(uint32_t ms) {
+        usleep(ms * 1000);
+    }
 #endif
 
 #endif /* PLATFORM_H */

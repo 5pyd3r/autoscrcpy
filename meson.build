@@ -10,7 +10,7 @@ project('autoscrcpy', 'c',
 
 # Windows-specific definitions
 if host_machine.system() == 'windows'
-    add_project_arguments('-DUNICODE', '-D_UNICODE', '-D_CRT_SECURE_NO_WARNINGS', language: 'c')
+    add_project_arguments('-DUNICODE', '-D_UNICODE', '-D_CRT_SECURE_NO_WARNINGS', '-DWIN32_LEAN_AND_MEAN', language: 'c')
 endif
 
 # Dependencies
@@ -34,6 +34,7 @@ if host_machine.system() == 'windows'
         cc.find_library('oleaut32'),
         cc.find_library('ws2_32'),
         cc.find_library('imm32'),
+        cc.find_library('bcrypt'),
     ]
 endif
 

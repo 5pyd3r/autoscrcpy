@@ -4,4 +4,4 @@ revision = v3.6.2
 depth = 1
 
 [provide]
-dependency_names = mbedtls
+mbedtls = mbedtls_dep
