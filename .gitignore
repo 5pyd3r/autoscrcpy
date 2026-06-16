@@ -1,0 +1,21 @@
+# Build directories
+builddir/
+build/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Compiled files
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Subprojects
+subprojects/*/
+!subprojects/*.wrap
