@@ -38,3 +38,4 @@ if host_machine.system() == 'windows'
 endif
 
 subdir('src')
+subdir('tests')
