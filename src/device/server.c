@@ -168,7 +168,49 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  video_sock->width, video_sock->height);
     }
 
-    /* Step 7: Connect control socket */
+    /* Step 7: Connect audio socket */
+    if (srv->config.audio) {
+        Sleep(1000);
+        audio_sock->fd = connect_to_port(forward_port);
+        if (audio_sock->fd == INVALID_SOCKFD) {
+            log_error("Failed to connect audio socket");
+            return false;
+        }
+
+        /* Read dummy byte */
+        uint8_t dummy;
+        int n = recv(audio_sock->fd, (char *)&dummy, 1, 0);
+        if (n != 1) {
+            log_error("Failed to read audio dummy byte");
+            return false;
+        }
+        log_info("Audio dummy byte: 0x%02x", dummy);
+
+        /* Read audio stream header (codec_id + sample_rate + channels) */
+        uint8_t audio_hdr[12];
+        int received = 0;
+        while (received < 12) {
+            n = recv(audio_sock->fd, audio_hdr + received, 12 - received, 0);
+            if (n <= 0) {
+                log_error("Failed to read audio stream header");
+                return false;
+            }
+            received += n;
+        }
+
+        uint32_t audio_codec_id = ((uint32_t)audio_hdr[0] << 24) | ((uint32_t)audio_hdr[1] << 16) |
+                                  ((uint32_t)audio_hdr[2] << 8) | (uint32_t)audio_hdr[3];
+        audio_sock->codec_id = audio_codec_id;
+        audio_sock->sample_rate = ((uint32_t)audio_hdr[4] << 24) | ((uint32_t)audio_hdr[5] << 16) |
+                                  ((uint32_t)audio_hdr[6] << 8) | (uint32_t)audio_hdr[7];
+        audio_sock->channels = ((uint32_t)audio_hdr[8] << 24) | ((uint32_t)audio_hdr[9] << 16) |
+                               ((uint32_t)audio_hdr[10] << 8) | (uint32_t)audio_hdr[11];
+
+        log_info("Audio stream: codec=%08x, %u Hz, %u channels",
+                 audio_codec_id, audio_sock->sample_rate, audio_sock->channels);
+    }
+
+    /* Step 8: Connect control socket */
     if (srv->config.control) {
         Sleep(1000);
         control_sock->fd = connect_to_port(forward_port);
