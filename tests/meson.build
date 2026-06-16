@@ -23,3 +23,10 @@ test_protocol = executable('test_protocol', 'test_protocol.c',
 )
 
 test('Protocol test', test_protocol)
+
+test_control_msg = executable('test_control_msg', 'test_control_msg.c',
+    '../src/control/control_msg.c',
+    '../src/platform/log.c',
+    dependencies: winlibs,
+)
+test('Control message test', test_control_msg)
