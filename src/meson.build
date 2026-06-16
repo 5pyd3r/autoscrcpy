@@ -66,6 +66,7 @@ record_src = files(
 # Audio sources
 audio_src = files(
     'audio/player.c',
+    'audio/regulator.c',
 )
 
 # App sources
