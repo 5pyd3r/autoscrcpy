@@ -1,11 +1,25 @@
-Texture2D tex : register(t0);
-SamplerState sam : register(s0);
+Texture2D<float>  luminanceChannel   : t0;
+Texture2D<float2> chrominanceChannel : t1;
 
-struct PS_INPUT {
-    float4 pos : SV_POSITION;
-    float2 tex : TEXCOORD0;
+SamplerState splr;
+
+static const float3x3 YUVtoRGBCoeffMatrix =
+{
+    1.164383f,  1.164383f, 1.164383f,
+    0.000000f, -0.391762f, 2.017232f,
+    1.596027f, -0.812968f, 0.000000f
 };
 
-float4 main(PS_INPUT input) : SV_Target {
-    return tex.Sample(sam, input.tex);
+float3 ConvertYUVtoRGB(float3 yuv)
+{
+    yuv -= float3(0.062745f, 0.501960f, 0.501960f);
+    yuv = mul(yuv, YUVtoRGBCoeffMatrix);
+    return saturate(yuv);
+}
+
+float4 main(float2 tc: TexCoord) : SV_Target
+{
+    float y = luminanceChannel.Sample(splr, tc);
+    float2 uv = chrominanceChannel.Sample(splr, tc);
+    return float4(ConvertYUVtoRGB(float3(y, uv)), 1);
 }

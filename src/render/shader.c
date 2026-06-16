@@ -35,6 +35,38 @@ bool shader_init(shader_t *shader, ID3D11Device *device,
     return true;
 }
 
+bool shader_init_from_bytecode(shader_t *shader, ID3D11Device *device,
+                                const void *vs_data, uint32_t vs_size,
+                                const void *ps_data, uint32_t ps_size) {
+    HRESULT hr;
+
+    hr = device->lpVtbl->CreateVertexShader(device, vs_data, vs_size, NULL, &shader->vs);
+    if (FAILED(hr)) {
+        log_error("Failed to create vertex shader from bytecode: 0x%08x", hr);
+        return false;
+    }
+
+    hr = device->lpVtbl->CreatePixelShader(device, ps_data, ps_size, NULL, &shader->ps);
+    if (FAILED(hr)) {
+        log_error("Failed to create pixel shader from bytecode: 0x%08x", hr);
+        return false;
+    }
+
+    D3D11_INPUT_ELEMENT_DESC layout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+
+    hr = device->lpVtbl->CreateInputLayout(device, layout, 2,
+                                            vs_data, vs_size, &shader->layout);
+    if (FAILED(hr)) {
+        log_error("Failed to create input layout: 0x%08x", hr);
+        return false;
+    }
+
+    return true;
+}
+
 void shader_bind(shader_t *shader, ID3D11DeviceContext *ctx) {
     ctx->lpVtbl->VSSetShader(ctx, shader->vs, NULL, 0);
     ctx->lpVtbl->PSSetShader(ctx, shader->ps, NULL, 0);

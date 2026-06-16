@@ -1,16 +1,16 @@
-struct VS_INPUT {
-    float3 pos : POSITION;
-    float2 tex : TEXCOORD0;
-};
-
-struct VS_OUTPUT {
+struct VSOut {
+    float2 tex : TexCoord;
     float4 pos : SV_POSITION;
-    float2 tex : TEXCOORD0;
 };
 
-VS_OUTPUT main(VS_INPUT input) {
-    VS_OUTPUT output;
-    output.pos = float4(input.pos, 1.0);
-    output.tex = input.tex;
-    return output;
+cbuffer CBuf {
+    matrix transform;
+};
+
+VSOut main(float3 pos : POSITION, float2 tex: TexCoord)
+{
+    VSOut vsout;
+    vsout.pos = mul(float4(pos.x, pos.y, pos.z, 1), transform);
+    vsout.tex = tex;
+    return vsout;
 }
