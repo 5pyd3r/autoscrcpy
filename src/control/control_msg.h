@@ -30,6 +30,17 @@ enum control_msg_type {
     CONTROL_MSG_TYPE_RESIZE_DISPLAY,
 };
 
-#define CONTROL_MSG_MAX_SIZE (1 << 18) // 256k
+#define CONTROL_MSG_MAX_SIZE (1 << 18) /* 256k */
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+    uint16_t width;
+    uint16_t height;
+} control_position_t;
+
+/* Serialize a control message into buf. Returns bytes written, or 0 on error. */
+uint32_t control_msg_serialize(enum control_msg_type type,
+                                const void *msg_data, uint8_t *buf, uint32_t buf_size);
 
 #endif /* CONTROL_MSG_H */

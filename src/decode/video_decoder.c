@@ -86,32 +86,48 @@ bool video_decoder_decode(video_decoder_t *decoder, const uint8_t *data,
         return false;
     }
 
-    // Convert frame to output format
-    frame->width = decoder->frame->width;
-    frame->height = decoder->frame->height;
-    frame->format = 1; // BGRA
+    uint32_t w = decoder->frame->width;
+    uint32_t h = decoder->frame->height;
 
-    // Allocate output buffer
-    uint32_t bgra_size = frame->width * frame->height * 4;
-    frame->data = malloc(bgra_size);
+    frame->width = w;
+    frame->height = h;
+    frame->format = 0; /* NV12 */
+
+    /* NV12 buffer: Y plane (w*h) + UV plane (w*h/2) */
+    uint32_t nv12_size = w * h + w * (h / 2);
+    frame->data = malloc(nv12_size);
     if (!frame->data) {
-        log_error("Failed to allocate frame buffer");
+        log_error("Failed to allocate NV12 frame buffer");
         return false;
     }
 
-    // Convert YUV to BGRA
-    // TODO: Use swscale for proper conversion
-    for (uint32_t y = 0; y < frame->height; y++) {
-        for (uint32_t x = 0; x < frame->width; x++) {
-            uint32_t idx = (y * frame->width + x) * 4;
-            frame->data[idx + 0] = 0; // B
-            frame->data[idx + 1] = 0; // G
-            frame->data[idx + 2] = 0; // R
-            frame->data[idx + 3] = 255; // A
+    /* Copy Y plane */
+    uint8_t *y_dst = frame->data;
+    const uint8_t *y_src = decoder->frame->data[0];
+    for (uint32_t row = 0; row < h; row++) {
+        memcpy(y_dst + row * w, y_src + row * decoder->frame->linesize[0], w);
+    }
+
+    /* Interleave UV planes into NV12 format */
+    uint8_t *uv_dst = frame->data + w * h;
+    const uint8_t *u_src = decoder->frame->data[1];
+    const uint8_t *v_src = decoder->frame->data[2];
+    int uv_stride = decoder->frame->linesize[1];
+    for (uint32_t row = 0; row < h / 2; row++) {
+        for (uint32_t col = 0; col < w / 2; col++) {
+            uv_dst[row * w + col * 2 + 0] = u_src[row * uv_stride + col];
+            uv_dst[row * w + col * 2 + 1] = v_src[row * uv_stride + col];
         }
     }
 
     return true;
+}
+
+void video_frame_free(video_frame_t *frame) {
+    if (frame && frame->data) {
+        free(frame->data);
+        frame->data = NULL;
+    }
 }
 
 void video_decoder_destroy(video_decoder_t *decoder) {

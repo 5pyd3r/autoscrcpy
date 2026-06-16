@@ -52,6 +52,9 @@ int muxer_add_video_stream(muxer_t *mux, uint32_t codec_id, uint32_t width, uint
         case 0x68323635: // h265
             stream->codecpar->codec_id = AV_CODEC_ID_HEVC;
             break;
+        case 0x00415631: // av01
+            stream->codecpar->codec_id = AV_CODEC_ID_AV1;
+            break;
         default:
             log_error("Unsupported video codec: 0x%08x", codec_id);
             return -1;
@@ -78,6 +81,9 @@ int muxer_add_audio_stream(muxer_t *mux, uint32_t codec_id, uint32_t sample_rate
             break;
         case 0x61616320: // aac
             stream->codecpar->codec_id = AV_CODEC_ID_AAC;
+            break;
+        case 0x666c6163: // flac
+            stream->codecpar->codec_id = AV_CODEC_ID_FLAC;
             break;
         default:
             log_error("Unsupported audio codec: 0x%08x", codec_id);

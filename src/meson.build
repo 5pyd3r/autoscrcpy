@@ -43,6 +43,8 @@ input_src = files(
     'input/keyboard.c',
     'input/mouse.c',
     'input/gamepad.c',
+    'input/keycode_map.c',
+    'input/input_transform.c',
 )
 
 # Control sources
