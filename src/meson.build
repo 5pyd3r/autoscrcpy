@@ -78,6 +78,6 @@ executable('autoscrcpy',
     control_src,
     record_src,
     app_src,
-    dependencies: [ffmpeg_dep, mbedtls_dep] + winlibs,
+    dependencies: [libavcodec_dep, libavformat_dep, libavutil_dep, libswscale_dep, mbedtls_dep] + winlibs,
     install: true,
 )

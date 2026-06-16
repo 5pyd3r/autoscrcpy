@@ -14,7 +14,10 @@ if host_machine.system() == 'windows'
 endif
 
 # Dependencies
-ffmpeg_dep = dependency('libavcodec', 'libavformat', 'libavutil', 'libswscale', required: true)
+libavcodec_dep = dependency('libavcodec', required: true)
+libavformat_dep = dependency('libavformat', required: true)
+libavutil_dep = dependency('libavutil', required: true)
+libswscale_dep = dependency('libswscale', required: true)
 mbedtls_dep = dependency('mbedtls', required: true)
 
 # Windows libraries
