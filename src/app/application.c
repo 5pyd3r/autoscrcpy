@@ -69,6 +69,10 @@ static DWORD WINAPI audio_receiver_thread(LPVOID arg) {
         audio_frame_t aframe;
         memset(&aframe, 0, sizeof(aframe));
         if (audio_decoder_decode(app->audio_decoder, data, size, &aframe)) {
+            /* Play decoded audio */
+            if (app->audio_player && aframe.data) {
+                audio_player_write(app->audio_player, aframe.data, aframe.size);
+            }
             if (aframe.data) free(aframe.data);
         }
 
@@ -83,6 +87,7 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
     app->running = false;
     app->video_decoder = NULL;
     app->audio_decoder = NULL;
+    app->audio_player = NULL;
     app->video_thread = NULL;
     app->audio_thread = NULL;
     app->stop_event = NULL;
@@ -136,6 +141,19 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
     app->audio_decoder = audio_decoder_create();
     if (!app->audio_decoder) {
         log_error("Failed to create audio decoder");
+        return false;
+    }
+
+    /* Create audio player */
+    app->audio_player = audio_player_create();
+    if (!app->audio_player) {
+        log_error("Failed to create audio player");
+        return false;
+    }
+
+    /* Initialize audio player with default settings (will be reconfigured when audio stream info is available) */
+    if (!audio_player_init(app->audio_player, 48000, 2)) {
+        log_error("Failed to initialize audio player");
         return false;
     }
 
@@ -236,6 +254,11 @@ void application_destroy(application_t *app) {
     if (app->audio_decoder) {
         audio_decoder_destroy(app->audio_decoder);
         app->audio_decoder = NULL;
+    }
+
+    if (app->audio_player) {
+        audio_player_destroy(app->audio_player);
+        app->audio_player = NULL;
     }
 
     /* Skip renderer cleanup for now */
