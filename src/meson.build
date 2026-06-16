@@ -21,6 +21,7 @@ device_src = files(
     'device/audio_socket.c',
     'device/control_socket.c',
     'device/device_msg.c',
+    'device/demuxer.c',
 )
 
 # Decode sources
@@ -28,6 +29,7 @@ decode_src = files(
     'decode/video_decoder.c',
     'decode/audio_decoder.c',
     'decode/packet_queue.c',
+    'decode/frame_buffer.c',
 )
 
 # Render sources
@@ -52,6 +54,7 @@ control_src = files(
     'control/control_msg.c',
     'control/clipboard.c',
     'control/power.c',
+    'control/controller.c',
 )
 
 # Record sources
