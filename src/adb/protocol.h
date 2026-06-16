@@ -22,4 +22,13 @@ int adb_recv_msg_tls(void *tls, SOCKET_T fd, adb_message_t *out_hdr,
 /* Compute ADB payload checksum */
 uint32_t adb_checksum(const uint8_t *data, uint32_t len);
 
+/* Connection-aware send (uses TLS if conn->tls_ctx is set) */
+int adb_send_msg_conn(adb_connection_t *conn, uint32_t cmd, uint32_t arg0,
+                      uint32_t arg1, const uint8_t *data, uint32_t data_len,
+                      int skip_checksum);
+
+/* Connection-aware recv (uses TLS if conn->tls_ctx is set) */
+int adb_recv_msg_conn(adb_connection_t *conn, adb_message_t *out_hdr,
+                      uint8_t *out_payload, int max_payload, int skip_checksum);
+
 #endif /* PROTOCOL_H */

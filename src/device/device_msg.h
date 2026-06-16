@@ -31,4 +31,9 @@ struct device_msg {
 int device_msg_deserialize(const uint8_t *data, uint32_t len, struct device_msg *msg);
 void device_msg_destroy(struct device_msg *msg);
 
+int device_msg_serialize_clipboard(const char *text, uint32_t len,
+                                   uint64_t sequence, uint8_t *buf, uint32_t buf_size);
+int device_msg_serialize_ack_clipboard(uint64_t sequence,
+                                        uint8_t *buf, uint32_t buf_size);
+
 #endif /* DEVICE_MSG_H */

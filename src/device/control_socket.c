@@ -8,6 +8,27 @@ bool control_socket_init(control_socket_t *sock, SOCKET_T fd) {
     return true;
 }
 
+bool control_socket_accept(control_socket_t *sock, SOCKET_T listen_fd) {
+    struct sockaddr_in client_addr;
+    int addr_len = sizeof(client_addr);
+    SOCKET_T client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
+    if (client_fd == INVALID_SOCKFD) {
+        log_error("Failed to accept control connection");
+        return false;
+    }
+
+    uint8_t dummy;
+    int n = recv(client_fd, (char *)&dummy, 1, 0);
+    if (n != 1) {
+        log_error("Failed to read control dummy byte");
+        CLOSESOCKET(client_fd);
+        return false;
+    }
+
+    sock->fd = client_fd;
+    return true;
+}
+
 bool control_socket_send_msg(control_socket_t *sock, const uint8_t *data, uint32_t size) {
     // Send size header
     uint32_t net_size = htonl(size);

@@ -194,3 +194,22 @@ int adb_recv_msg_tls(void *tls, SOCKET_T fd, adb_message_t *out_hdr,
 
     return 0;
 }
+
+int adb_send_msg_conn(adb_connection_t *conn, uint32_t cmd, uint32_t arg0,
+                      uint32_t arg1, const uint8_t *data, uint32_t data_len,
+                      int skip_checksum) {
+    if (conn->tls_ctx) {
+        return adb_send_msg_tls(conn->tls_ctx, conn->fd, cmd, arg0, arg1,
+                                data, data_len, skip_checksum);
+    }
+    return adb_send_msg(conn->fd, cmd, arg0, arg1, data, data_len, skip_checksum);
+}
+
+int adb_recv_msg_conn(adb_connection_t *conn, adb_message_t *out_hdr,
+                      uint8_t *out_payload, int max_payload, int skip_checksum) {
+    if (conn->tls_ctx) {
+        return adb_recv_msg_tls(conn->tls_ctx, conn->fd, out_hdr,
+                                out_payload, max_payload, skip_checksum);
+    }
+    return adb_recv_msg(conn->fd, out_hdr, out_payload, max_payload, skip_checksum);
+}

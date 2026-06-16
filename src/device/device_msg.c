@@ -1,4 +1,5 @@
 #include "device_msg.h"
+#include "../adb/binary.h"
 #include "../platform/log.h"
 #include <stdlib.h>
 #include <string.h>
@@ -74,4 +75,25 @@ void device_msg_destroy(struct device_msg *msg) {
         default:
             break;
     }
+}
+
+int device_msg_serialize_clipboard(const char *text, uint32_t len,
+                                   uint64_t sequence, uint8_t *buf, uint32_t buf_size) {
+    uint32_t total = 1 + 8 + 4 + len;
+    if (total > buf_size) return -1;
+
+    buf[0] = DEVICE_MSG_TYPE_CLIPBOARD;
+    write64be(&buf[1], sequence);
+    write32be(&buf[9], len);
+    memcpy(&buf[13], text, len);
+    return (int)total;
+}
+
+int device_msg_serialize_ack_clipboard(uint64_t sequence,
+                                        uint8_t *buf, uint32_t buf_size) {
+    if (buf_size < 9) return -1;
+
+    buf[0] = DEVICE_MSG_TYPE_ACK_CLIPBOARD;
+    write64be(&buf[1], sequence);
+    return 9;
 }

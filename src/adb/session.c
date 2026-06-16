@@ -1,6 +1,7 @@
 #include "session.h"
 #include "protocol.h"
 #include "crypto.h"
+#include "tls.h"
 #include "../platform/log.h"
 #include <string.h>
 #include <stdlib.h>
@@ -38,8 +39,8 @@ SOCKET_T session_connect(const char *host, int port) {
 
 void session_send_cnxn(adb_connection_t *conn) {
     const char *banner = ADB_BANNER;
-    int ret = adb_send_msg(conn->fd, ADB_CNXN, ADB_VERSION, ADB_MAX_PAYLOAD,
-                           (const uint8_t *)banner, (uint32_t)(strlen(banner) + 1), 1);
+    int ret = adb_send_msg_conn(conn, ADB_CNXN, ADB_VERSION, ADB_MAX_PAYLOAD,
+                                (const uint8_t *)banner, (uint32_t)(strlen(banner) + 1), 1);
     if (ret < 0) {
         log_error("Failed to send CNXN message");
     }
@@ -65,7 +66,7 @@ adb_channel_t *session_open_channel(adb_connection_t *conn, const char *service)
     chan->state = CHAN_OPENING;
     chan->local_fd = INVALID_SOCKFD;
 
-    int ret = adb_send_msg(conn->fd, ADB_OPEN, chan->local_id, 0,
+    int ret = adb_send_msg_conn(conn, ADB_OPEN, chan->local_id, 0,
                            (const uint8_t *)service, (uint32_t)(strlen(service) + 1), 1);
     if (ret < 0) {
         log_error("Failed to send OPEN message");
@@ -80,7 +81,7 @@ void session_close_channel(adb_connection_t *conn, adb_channel_t *chan) {
     if (chan->state == CHAN_CLOSED) return;
 
     if (chan->remote_id != 0) {
-        adb_send_msg(conn->fd, ADB_CLSE, chan->local_id, chan->remote_id, NULL, 0, 1);
+        adb_send_msg_conn(conn, ADB_CLSE, chan->local_id, chan->remote_id, NULL, 0, 1);
     }
 
     chan->state = CHAN_CLOSED;
@@ -99,13 +100,26 @@ void session_handle_message(adb_connection_t *conn, const adb_message_t *msg,
             }
             break;
 
+        case ADB_STLS:
+            log_info("Server requested TLS");
+            conn->state = ADB_STATE_TLS_NEGOTIATING;
+            adb_send_msg_conn(conn, ADB_STLS, 0, 0, NULL, 0, 1);
+            conn->tls_ctx = tls_handshake(conn->fd);
+            if (conn->tls_ctx) {
+                log_info("TLS handshake successful");
+                session_send_cnxn(conn);
+            } else {
+                log_error("TLS handshake failed");
+            }
+            break;
+
         case ADB_AUTH:
             if (msg->arg0 == ADB_AUTH_TYPE_TOKEN) {
                 /* Sign token with RSA key */
                 uint8_t sig[256];
                 int sig_len;
                 if (crypto_sign_token(payload, msg->data_length, sig, &sig_len) == 0) {
-                    adb_send_msg(conn->fd, ADB_AUTH, ADB_AUTH_TYPE_RSAKEY, 0,
+                    adb_send_msg_conn(conn, ADB_AUTH, ADB_AUTH_TYPE_RSAKEY, 0,
                                  sig, (uint32_t)sig_len, 1);
                     conn->state = ADB_STATE_AUTH_SENT;
                 }
@@ -124,7 +138,7 @@ void session_handle_message(adb_connection_t *conn, const adb_message_t *msg,
                 }
             }
             /* Send OKAY */
-            adb_send_msg(conn->fd, ADB_OKAY, local_id, remote_id, NULL, 0, 1);
+            adb_send_msg_conn(conn, ADB_OKAY, local_id, remote_id, NULL, 0, 1);
             break;
         }
 
@@ -152,7 +166,7 @@ void session_handle_message(adb_connection_t *conn, const adb_message_t *msg,
                                               conn->on_shell_output_arg);
                     }
                     /* Send OKAY to acknowledge */
-                    adb_send_msg(conn->fd, ADB_OKAY, local_id, remote_id, NULL, 0, 1);
+                    adb_send_msg_conn(conn, ADB_OKAY, local_id, remote_id, NULL, 0, 1);
                     break;
                 }
             }
@@ -187,4 +201,39 @@ void session_disconnect(adb_connection_t *conn) {
     }
 
     conn->state = ADB_STATE_DISCONNECTED;
+}
+
+int session_recv_msg(adb_connection_t *conn, adb_message_t *out_hdr,
+                     uint8_t *out_payload, int max_payload) {
+    return adb_recv_msg_conn(conn, out_hdr, out_payload, max_payload,
+                             conn->protocol_version >= ADB_VERSION_SKIP_CHECKSUM);
+}
+
+int session_poll(adb_connection_t *conn, int timeout_ms) {
+    if (conn->fd == INVALID_SOCKFD) return -1;
+
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(conn->fd, &read_fds);
+
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+    int ret = select((int)conn->fd + 1, &read_fds, NULL, NULL, &tv);
+    if (ret < 0) {
+        log_error("select() failed: %d", SOCKET_ERRNO);
+        return -1;
+    }
+    if (ret == 0) return 0; /* timeout */
+
+    /* Read one message */
+    adb_message_t hdr;
+    uint8_t payload[ADB_MAX_PAYLOAD];
+    if (session_recv_msg(conn, &hdr, payload, sizeof(payload)) < 0) {
+        return -1;
+    }
+
+    session_handle_message(conn, &hdr, payload);
+    return 1;
 }

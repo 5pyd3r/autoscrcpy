@@ -13,6 +13,7 @@ typedef struct {
 } video_socket_t;
 
 bool video_socket_init(video_socket_t *sock, SOCKET_T fd);
+bool video_socket_accept(video_socket_t *sock, SOCKET_T listen_fd);
 bool video_socket_read_packet(video_socket_t *sock, uint8_t **data, uint32_t *size);
 void video_socket_destroy(video_socket_t *sock);
 

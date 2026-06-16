@@ -25,4 +25,11 @@ void session_close_channel(adb_connection_t *conn, adb_channel_t *chan);
 /* Graceful connection teardown */
 void session_disconnect(adb_connection_t *conn);
 
+/* Non-blocking poll: process pending ADB messages */
+int session_poll(adb_connection_t *conn, int timeout_ms);
+
+/* Receive one message (TLS-aware), blocking */
+int session_recv_msg(adb_connection_t *conn, adb_message_t *out_hdr,
+                     uint8_t *out_payload, int max_payload);
+
 #endif /* SESSION_H */

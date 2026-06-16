@@ -3,6 +3,7 @@
 #include "session.h"
 #include "crypto.h"
 #include "tls.h"
+#include "binary.h"
 #include "../platform/log.h"
 #include <string.h>
 #include <stdlib.h>
@@ -108,20 +109,111 @@ bool adb_shell(adb_connection_t *conn, const char *command) {
     return true;
 }
 
+#define SYNC_MAX_CHUNK (64 * 1024)
+
+static bool adb_sync_send(adb_connection_t *conn, adb_channel_t *chan,
+                          const char *remote_path, FILE *local_file) {
+    /* Wait for channel to open */
+    int retries = 200;
+    while (chan->state == CHAN_OPENING && retries > 0) {
+        session_poll(conn, 50);
+        retries--;
+    }
+    if (chan->state != CHAN_OPEN) {
+        log_error("Sync channel did not open");
+        return false;
+    }
+
+    /* Send SEND command */
+    uint8_t cmd_buf[4 + 4 + 512];
+    memcpy(cmd_buf, "SEND", 4);
+    uint32_t path_len = (uint32_t)strlen(remote_path);
+    write32le(cmd_buf + 4, path_len);
+    memcpy(cmd_buf + 8, remote_path, path_len);
+
+    adb_send_msg_conn(conn, ADB_WRTE, chan->local_id, chan->remote_id,
+                      cmd_buf, 8 + path_len, 1);
+    session_poll(conn, 100);
+
+    /* Stream file data */
+    uint8_t chunk_buf[4 + 4 + SYNC_MAX_CHUNK];
+    while (!feof(local_file)) {
+        size_t nread = fread(chunk_buf + 8, 1, SYNC_MAX_CHUNK, local_file);
+        if (nread == 0) break;
+
+        memcpy(chunk_buf, "DATA", 4);
+        write32le(chunk_buf + 4, (uint32_t)nread);
+
+        adb_send_msg_conn(conn, ADB_WRTE, chan->local_id, chan->remote_id,
+                          chunk_buf, 8 + (uint32_t)nread, 1);
+        session_poll(conn, 50);
+    }
+
+    /* Send DONE */
+    memcpy(chunk_buf, "DONE", 4);
+    write32le(chunk_buf + 4, 0);
+    adb_send_msg_conn(conn, ADB_WRTE, chan->local_id, chan->remote_id,
+                      chunk_buf, 8, 1);
+
+    /* Wait for OKAY */
+    retries = 200;
+    while (retries > 0) {
+        int r = session_poll(conn, 100);
+        if (r > 0) break;
+        retries--;
+    }
+
+    return true;
+}
+
 bool adb_push(adb_connection_t *conn, const char *local, const char *remote) {
-    /* TODO: Implement file push using sync protocol */
-    (void)conn;
-    (void)local;
-    (void)remote;
-    log_error("adb_push not yet implemented");
-    return false;
+    if (!conn || conn->state != ADB_STATE_CONNECTED) {
+        log_error("Not connected");
+        return false;
+    }
+
+    FILE *fp = fopen(local, "rb");
+    if (!fp) {
+        log_error("Failed to open local file: %s", local);
+        return false;
+    }
+
+    adb_channel_t *chan = session_open_channel(conn, "sync:");
+    if (!chan) {
+        log_error("Failed to open sync channel");
+        fclose(fp);
+        return false;
+    }
+
+    bool ret = adb_sync_send(conn, chan, remote, fp);
+
+    session_close_channel(conn, chan);
+    fclose(fp);
+
+    if (ret) {
+        log_info("Pushed %s -> %s", local, remote);
+    } else {
+        log_error("Failed to push %s -> %s", local, remote);
+    }
+
+    return ret;
 }
 
 bool adb_forward(adb_connection_t *conn, uint16_t local_port, const char *remote_spec) {
-    /* TODO: Implement port forwarding */
-    (void)conn;
-    (void)local_port;
-    (void)remote_spec;
-    log_error("adb_forward not yet implemented");
-    return false;
+    if (!conn || conn->state != ADB_STATE_CONNECTED) {
+        log_error("Not connected");
+        return false;
+    }
+
+    char service[SERVICE_NAME_MAX];
+    snprintf(service, sizeof(service), "tcp:%u", local_port);
+
+    adb_channel_t *chan = session_open_channel(conn, service);
+    if (!chan) {
+        log_error("Failed to open forward channel: %s", service);
+        return false;
+    }
+
+    log_info("Forward channel opened: %s -> %s", service, remote_spec);
+    return true;
 }
