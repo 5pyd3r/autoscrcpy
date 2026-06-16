@@ -35,6 +35,8 @@ if host_machine.system() == 'windows'
         cc.find_library('ws2_32'),
         cc.find_library('imm32'),
         cc.find_library('bcrypt'),
+        cc.find_library('uuid'),
+        cc.find_library('mmdevapi'),
     ]
 endif
 

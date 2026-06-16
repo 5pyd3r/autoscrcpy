@@ -60,6 +60,11 @@ record_src = files(
     'record/muxer.c',
 )
 
+# Audio sources
+audio_src = files(
+    'audio/player.c',
+)
+
 # App sources
 app_src = files(
     'app/application.c',
@@ -79,6 +84,7 @@ executable('autoscrcpy',
     input_src,
     control_src,
     record_src,
+    audio_src,
     app_src,
     dependencies: [libavcodec_dep, libavformat_dep, libavutil_dep, libswscale_dep, mbedtls_dep] + winlibs,
     install: true,

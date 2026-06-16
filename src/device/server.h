@@ -3,6 +3,10 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "../platform/platform.h"
+#include "video_socket.h"
+#include "audio_socket.h"
+#include "control_socket.h"
 
 struct server_config {
     const char *serial;
@@ -18,8 +22,17 @@ struct server_config {
     bool audio;
 };
 
-bool server_push(struct server_config *config);
-bool server_start(struct server_config *config);
-void server_kill(void);
+typedef struct server {
+    struct server_config config;
+    SOCKET_T listen_fd;
+    void *adb_conn;
+    bool running;
+} server_t;
+
+bool server_init(server_t *srv, const struct server_config *config);
+bool server_start(server_t *srv, video_socket_t *video_sock,
+                  audio_socket_t *audio_sock, control_socket_t *control_sock);
+void server_kill(server_t *srv);
+void server_destroy(server_t *srv);
 
 #endif /* SERVER_H */

@@ -10,6 +10,7 @@
 #include "../device/video_socket.h"
 #include "../device/audio_socket.h"
 #include "../device/control_socket.h"
+#include "../device/server.h"
 #include <stdbool.h>
 
 typedef struct {
@@ -22,7 +23,13 @@ typedef struct {
     video_socket_t video_sock;
     audio_socket_t audio_sock;
     control_socket_t control_sock;
+    server_t server;
+    HANDLE video_thread;
+    HANDLE audio_thread;
+    HANDLE stop_event;
     bool running;
+    uint32_t device_width;
+    uint32_t device_height;
 } application_t;
 
 bool application_init(application_t *app, const struct scrcpy_options *options);
