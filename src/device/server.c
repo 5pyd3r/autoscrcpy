@@ -25,7 +25,7 @@ static SOCKET_T connect_to_port(uint16_t port) {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);
 
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < 30; i++) {
         if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
             return fd;
         }
@@ -34,31 +34,6 @@ static SOCKET_T connect_to_port(uint16_t port) {
 
     CLOSESOCKET(fd);
     return INVALID_SOCKFD;
-}
-
-/* Launch a process in the background (detached) */
-static bool launch_background(const char *cmd) {
-    STARTUPINFOA si = {0};
-    PROCESS_INFORMATION pi = {0};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    char cmd_buf[2048];
-    snprintf(cmd_buf, sizeof(cmd_buf), "cmd.exe /C %s", cmd);
-
-    BOOL ret = CreateProcessA(
-        NULL, cmd_buf, NULL, NULL, FALSE,
-        CREATE_NO_WINDOW | DETACHED_PROCESS,
-        NULL, NULL, &si, &pi);
-
-    if (ret) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return true;
-    }
-    log_error("CreateProcess failed: %lu", GetLastError());
-    return false;
 }
 
 bool server_start(server_t *srv, video_socket_t *video_sock,
@@ -105,7 +80,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         Sleep(1000);
     }
 
-    /* Step 4: Push jar file again (it may have been deleted by cleanup) */
+    /* Step 4: Push jar file again (cleanup may have deleted it) */
     {
         char cmd[512];
         snprintf(cmd, sizeof(cmd), "%s -s %s push C:/Users/Spyder/Downloads/scrcpy-win64-v3.3.2/scrcpy-server /data/local/tmp/scrcpy-server.jar",
@@ -113,7 +88,12 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         system(cmd);
     }
 
-    /* Step 5: Start scrcpy-server on device in background */
+    /* Step 5: Start scrcpy-server on device
+     *
+     * KEY: Use _spawnl with _P_NOWAIT to keep ADB connection open.
+     * If we use system(), the ADB shell session ends and kills the server.
+     * With _P_NOWAIT, the ADB process stays alive and the server keeps running.
+     */
     {
         char shell_cmd[1024];
         snprintf(shell_cmd, sizeof(shell_cmd),
@@ -132,22 +112,25 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  srv->config.video_bit_rate,
                  srv->config.audio_bit_rate);
 
-        char cmd[1280];
-        snprintf(cmd, sizeof(cmd), "%s -s %s shell %s",
-                 ADB_PATH, serial ? serial : "", shell_cmd);
-
         log_info("Starting scrcpy-server...");
-        if (!launch_background(cmd)) {
-            log_error("Failed to start scrcpy-server");
+
+        /* Use _spawnl with _P_NOWAIT to launch ADB in background */
+        intptr_t pid = _spawnl(_P_NOWAIT, ADB_PATH, ADB_PATH,
+                               "-s", serial ? serial : "",
+                               "shell", shell_cmd,
+                               NULL);
+        if (pid == -1) {
+            log_error("Failed to start scrcpy-server: _spawnl failed");
             return false;
         }
+        log_info("ADB process started (pid=%lld)", (long long)pid);
     }
 
     /* Wait for server to start and create socket */
     log_info("Waiting for server to start...");
     Sleep(5000);
 
-    /* Step 5: Connect video socket */
+    /* Step 6: Connect video socket */
     if (srv->config.video) {
         video_sock->fd = connect_to_port(forward_port);
         if (video_sock->fd == INVALID_SOCKFD) {
@@ -206,7 +189,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  video_sock->width, video_sock->height);
     }
 
-    /* Step 6: Connect control socket */
+    /* Step 7: Connect control socket */
     if (srv->config.control) {
         Sleep(1000);
         control_sock->fd = connect_to_port(forward_port);
@@ -225,7 +208,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
 void server_kill(server_t *srv) {
     if (srv->config.serial) {
         char cmd[512];
-        snprintf(cmd, sizeof(cmd), "\"%s\" -s %s shell pkill -f com.genymobile.scrcpy.Server",
+        snprintf(cmd, sizeof(cmd), "%s -s %s shell pkill -f com.genymobile.scrcpy.Server",
                  ADB_PATH, srv->config.serial);
         system(cmd);
     }
