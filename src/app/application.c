@@ -6,6 +6,7 @@
 #include "../input/input_transform.h"
 #include "../control/control_msg.h"
 #include <string.h>
+#include <stdio.h>
 
 static void on_key_event(uint32_t vk, bool down, void *userdata);
 static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons,
@@ -13,32 +14,59 @@ static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons,
 static void on_wheel_event(int32_t x, int32_t y, int32_t delta, void *userdata);
 static void on_resize(int32_t width, int32_t height, void *userdata);
 
+/* Read exactly n bytes from ADB channel via the relay socketpair */
+static int relay_read(SOCKET_T fd, void *buf, int n) {
+    int done = 0;
+    while (done < n) {
+        int r = recv(fd, (char *)buf + done, n - done, 0);
+        if (r <= 0) return -1;
+        done += r;
+    }
+    return 0;
+}
+
 static DWORD WINAPI video_receiver_thread(LPVOID arg) {
     application_t *app = (application_t *)arg;
+    fprintf(stderr, "VIDEO: thread started, fd=%d\n", (int)app->video_sock.fd);
+    fflush(stderr);
 
     while (app->running) {
-        uint8_t *data = NULL;
-        uint32_t size = 0;
-
-        if (!video_socket_read_packet(&app->video_sock, &data, &size)) {
-            if (app->running) log_error("Video socket read failed");
+        /* Read 12-byte packet header: PTS(8) + size(4) */
+        uint8_t header[12];
+        if (relay_read(app->video_sock.fd, header, 12) < 0) {
+            if (app->running) log_error("Video header read failed");
             break;
         }
 
-        if (app->video_sock.codec_id == 0 && size >= 12) {
-            app->video_sock.codec_id = *(uint32_t *)data;
-            app->video_sock.width = *(uint32_t *)(data + 4);
-            app->video_sock.height = *(uint32_t *)(data + 8);
-            app->device_width = app->video_sock.width;
-            app->device_height = app->video_sock.height;
+        uint64_t pts_raw = ((uint64_t)header[0] << 56) | ((uint64_t)header[1] << 48) |
+                           ((uint64_t)header[2] << 40) | ((uint64_t)header[3] << 32) |
+                           ((uint64_t)header[4] << 24) | ((uint64_t)header[5] << 16) |
+                           ((uint64_t)header[6] << 8) | (uint64_t)header[7];
+        uint32_t size = ((uint32_t)header[8] << 24) | ((uint32_t)header[9] << 16) |
+                        ((uint32_t)header[10] << 8) | (uint32_t)header[11];
+        bool is_config = (pts_raw & (1ULL << 62)) != 0;
+        bool is_keyframe = (pts_raw & (1ULL << 61)) != 0;
+        (void)is_config; (void)is_keyframe;
 
-            video_decoder_init(app->video_decoder, app->video_sock.codec_id,
-                               app->video_sock.width, app->video_sock.height);
+        static int pkt_count = 0;
+        if (pkt_count < 5) {
+            fprintf(stderr, "VIDEO: pkt %d, size=%u, pts=%llu %s%s\n",
+                    pkt_count, size, (unsigned long long)(pts_raw & ((1ULL<<61)-1)),
+                    is_config ? "[CONFIG]" : "", is_keyframe ? "[KEY]" : "");
+            fflush(stderr);
+        }
+        pkt_count++;
 
+        /* Read packet data */
+        uint8_t *data = malloc(size);
+        if (!data) break;
+        if (relay_read(app->video_sock.fd, data, size) < 0) {
             free(data);
-            continue;
+            if (app->running) log_error("Video data read failed");
+            break;
         }
 
+        /* Decode and render */
         video_frame_t frame;
         memset(&frame, 0, sizeof(frame));
         if (video_decoder_decode(app->video_decoder, data, size, &frame)) {
@@ -197,6 +225,18 @@ int application_run(application_t *app) {
                       &app->control_sock)) {
         log_error("Failed to start server");
         return 1;
+    }
+
+    /* Initialize video decoder now that we have codec info */
+    if (app->options.video && app->video_sock.codec_id != 0) {
+        app->device_width = app->video_sock.width;
+        app->device_height = app->video_sock.height;
+        if (!video_decoder_init(app->video_decoder, app->video_sock.codec_id,
+                                app->video_sock.width, app->video_sock.height)) {
+            log_error("Failed to init video decoder");
+            return 1;
+        }
+        log_info("Video decoder initialized: %ux%u", app->video_sock.width, app->video_sock.height);
     }
 
     window_show(&app->window);
