@@ -1,8 +1,10 @@
 #include "crypto.h"
 #include "../platform/log.h"
 #include <mbedtls/pk.h>
+#include <mbedtls/rsa.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#include <mbedtls/bignum.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -62,14 +64,40 @@ int crypto_get_public_key(uint8_t *buf, int *len) {
         return -1;
     }
 
-    /* Get public key in DER format */
-    int ret = mbedtls_pk_write_pubkey_der(&pk, buf, 512);
-    if (ret < 0) {
-        log_error("Failed to get public key: -0x%04x", -ret);
+    /* ADB format: 256-byte big-endian RSA modulus + 4-byte LE exponent = 260 bytes */
+    mbedtls_rsa_context *rsa = mbedtls_pk_rsa(pk);
+    if (!rsa) {
+        log_error("Key is not RSA");
         return -1;
     }
 
-    *len = ret;
+    mbedtls_mpi N, E;
+    mbedtls_mpi_init(&N);
+    mbedtls_mpi_init(&E);
+
+    int ret = mbedtls_rsa_export(rsa, &N, NULL, NULL, NULL, &E);
+    if (ret != 0) {
+        log_error("Failed to export RSA key: -0x%04x", -ret);
+        mbedtls_mpi_free(&N);
+        mbedtls_mpi_free(&E);
+        return -1;
+    }
+
+    /* Write modulus (256 bytes, big-endian, zero-padded) */
+    int mod_len = (int)mbedtls_mpi_size(&N);
+    if (mod_len > 256) mod_len = 256;
+    memset(buf, 0, 256);
+    mbedtls_mpi_write_binary(&N, buf + (256 - mod_len), mod_len);
+
+    /* Write exponent (little-endian uint32) */
+    unsigned char exp_buf[8];
+    mbedtls_mpi_write_binary_le(&E, exp_buf, sizeof(exp_buf));
+    memcpy(buf + 256, exp_buf, 4);
+
+    *len = 260;
+
+    mbedtls_mpi_free(&N);
+    mbedtls_mpi_free(&E);
     return 0;
 }
 
@@ -80,4 +108,14 @@ void crypto_free(void) {
         mbedtls_ctr_drbg_free(&ctr_drbg);
         crypto_initialized = 0;
     }
+}
+
+void *crypto_get_pk_context(void) {
+    if (!crypto_initialized) return NULL;
+    return &pk;
+}
+
+void *crypto_get_ctr_drbg(void) {
+    if (!crypto_initialized) return NULL;
+    return &ctr_drbg;
 }

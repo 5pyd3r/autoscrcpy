@@ -4,6 +4,7 @@
 #include "adb.h"
 
 int tls_init(void);
+int tls_configure_client_cert(void);
 void *tls_handshake(SOCKET_T fd);
 int tls_send(void *ssl_ctx, const void *buf, int len);
 int tls_recv(void *ssl_ctx, void *buf, int len);

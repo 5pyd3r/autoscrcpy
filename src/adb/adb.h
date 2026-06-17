@@ -20,6 +20,9 @@
 #define ADB_CLSE 0x45534c43
 #define ADB_STLS 0x534c5453
 
+/* STLS version */
+#define ADB_STLS_VERSION 0x01000000
+
 /* AUTH sub-types */
 #define ADB_AUTH_TYPE_TOKEN  1
 #define ADB_AUTH_TYPE_RSAKEY 2
