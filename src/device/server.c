@@ -240,25 +240,24 @@ static DWORD WINAPI adb_video_relay_thread(LPVOID arg) {
     fflush(stderr);
 
     while (r->running) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(r->conn->fd, &rfds);
-        struct timeval tv = {0, 100000}; /* 100ms */
-        int sel = select(0, &rfds, NULL, NULL, &tv);
-        if (sel <= 0) continue;
-
+        /* Read directly from TLS — adb_recv_msg_tls returns 0 on WANT_READ */
         adb_message_t msg;
         memset(&msg, 0, sizeof(msg));
         int ret = adb_recv_msg_conn(r->conn, &msg, pl, ADB_MAX_PAYLOAD, 1);
+        if (ret == 0) {
+            /* WANT_READ — no data available, sleep briefly and retry */
+            Sleep(1);
+            continue;
+        }
         if (ret == 1) {
             if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
                 /* Relay data to the socketpair */
                 static int frame_count = 0;
-                if (frame_count < 5) {
+                frame_count++;
+                if (frame_count <= 5 || frame_count % 100 == 0) {
                     fprintf(stderr, "RELAY: frame %d, %u bytes\n", frame_count, msg.data_length);
                     fflush(stderr);
                 }
-                frame_count++;
                 if (msg.data_length > 0) {
                     int sent = send(r->out_fd, (const char *)pl, msg.data_length, 0);
                     if (sent <= 0) {

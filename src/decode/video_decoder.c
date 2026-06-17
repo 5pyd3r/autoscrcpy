@@ -9,6 +9,8 @@ struct video_decoder {
     AVCodecContext *codec_ctx;
     AVFrame *frame;
     AVPacket *packet;
+    uint8_t *config_data;   /* buffered SPS/PPS from config packets */
+    uint32_t config_size;
 };
 
 video_decoder_t *video_decoder_create(void) {
@@ -70,12 +72,44 @@ bool video_decoder_init(video_decoder_t *decoder, uint32_t codec_id,
 
 bool video_decoder_decode(video_decoder_t *decoder, const uint8_t *data,
                           uint32_t size, video_frame_t *frame) {
-    decoder->packet->data = (uint8_t *)data;
-    decoder->packet->size = size;
+    /* For H.264: config packets (SPS/PPS) need to be set as extradata.
+     * Buffer config data and prepend to the next keyframe. */
+    if (size >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 &&
+        (data[3] == 1 || data[3] == 0)) {
+        /* Looks like Annex B NAL units — check if it's SPS/PPS (NAL type 7 or 8) */
+        int nal_type = data[3] == 0 ? (data[4] & 0x1F) : (data[3] & 0x1F);
+        if (nal_type == 7 || nal_type == 8) {
+            /* Config packet (SPS or PPS) — buffer it */
+            free(decoder->config_data);
+            decoder->config_data = malloc(size);
+            if (decoder->config_data) {
+                memcpy(decoder->config_data, data, size);
+                decoder->config_size = size;
+            }
+            return false; /* No frame to output yet */
+        }
+    }
+
+    /* If we have buffered config data, prepend it to this packet */
+    uint8_t *combined = NULL;
+    if (decoder->config_data && decoder->config_size > 0) {
+        combined = malloc(decoder->config_size + size);
+        if (combined) {
+            memcpy(combined, decoder->config_data, decoder->config_size);
+            memcpy(combined + decoder->config_size, data, size);
+            decoder->packet->data = combined;
+            decoder->packet->size = decoder->config_size + size;
+        }
+    }
+    if (!combined) {
+        decoder->packet->data = (uint8_t *)data;
+        decoder->packet->size = size;
+    }
 
     int ret = avcodec_send_packet(decoder->codec_ctx, decoder->packet);
+    free(combined);
     if (ret < 0) {
-        log_error("Failed to send packet to decoder");
+        /* Config packets may not produce a frame — that's OK */
         return false;
     }
 
@@ -133,6 +167,7 @@ void video_frame_free(video_frame_t *frame) {
 void video_decoder_destroy(video_decoder_t *decoder) {
     if (!decoder) return;
 
+    free(decoder->config_data);
     if (decoder->codec_ctx) {
         avcodec_free_context(&decoder->codec_ctx);
     }

@@ -49,13 +49,13 @@ static DWORD WINAPI video_receiver_thread(LPVOID arg) {
         (void)is_config; (void)is_keyframe;
 
         static int pkt_count = 0;
-        if (pkt_count < 5) {
+        pkt_count++;
+        if (pkt_count <= 5 || pkt_count % 100 == 0) {
             fprintf(stderr, "VIDEO: pkt %d, size=%u, pts=%llu %s%s\n",
                     pkt_count, size, (unsigned long long)(pts_raw & ((1ULL<<61)-1)),
                     is_config ? "[CONFIG]" : "", is_keyframe ? "[KEY]" : "");
             fflush(stderr);
         }
-        pkt_count++;
 
         /* Read packet data */
         uint8_t *data = malloc(size);
@@ -70,11 +70,19 @@ static DWORD WINAPI video_receiver_thread(LPVOID arg) {
         video_frame_t frame;
         memset(&frame, 0, sizeof(frame));
         if (video_decoder_decode(app->video_decoder, data, size, &frame)) {
+            static int render_count = 0;
+            render_count++;
+            if (render_count <= 3 || render_count % 100 == 0) {
+                fprintf(stderr, "VIDEO: decoded frame %d, %ux%u\n",
+                        render_count, frame.width, frame.height);
+                fflush(stderr);
+            }
             d3d_context_begin_frame(&app->d3d_ctx);
             video_renderer_render(&app->renderer, &frame);
             d3d_context_end_frame(&app->d3d_ctx);
             video_frame_free(&frame);
         }
+        /* else: config packet buffered, no frame output yet — that's OK */
 
         free(data);
     }
