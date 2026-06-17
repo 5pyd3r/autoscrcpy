@@ -193,6 +193,93 @@ fail:
     return NULL;
 }
 
+/* Create a TCP loopback socketpair (Windows doesn't have socketpair()) */
+static int create_socketpair(SOCKET_T fds[2]) {
+    SOCKET_T listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd == INVALID_SOCKFD) return -1;
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0); /* let OS pick port */
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        CLOSESOCKET(listen_fd); return -1;
+    }
+    socklen_t alen = sizeof(addr);
+    getsockname(listen_fd, (struct sockaddr *)&addr, &alen);
+    if (listen(listen_fd, 1) < 0) {
+        CLOSESOCKET(listen_fd); return -1;
+    }
+    fds[0] = socket(AF_INET, SOCK_STREAM, 0);
+    if (fds[0] == INVALID_SOCKFD) { CLOSESOCKET(listen_fd); return -1; }
+    if (connect(fds[0], (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        CLOSESOCKET(fds[0]); CLOSESOCKET(listen_fd); return -1;
+    }
+    fds[1] = accept(listen_fd, NULL, NULL);
+    CLOSESOCKET(listen_fd);
+    if (fds[1] == INVALID_SOCKFD) { CLOSESOCKET(fds[0]); return -1; }
+    return 0;
+}
+
+/* ADB channel → socket relay thread */
+typedef struct {
+    adb_connection_t *conn;
+    adb_channel_t    *chan;
+    SOCKET_T          out_fd;   /* write side of socketpair */
+    volatile int      running;
+} adb_relay_t;
+
+static DWORD WINAPI adb_video_relay_thread(LPVOID arg) {
+    adb_relay_t *r = (adb_relay_t *)arg;
+    /* Allocate large buffer for video frames (up to ADB_MAX_PAYLOAD = 1MB) */
+    uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
+    if (!pl) return 0;
+    fprintf(stderr, "RELAY: thread started, remote_id=%u\n", r->chan->remote_id);
+    fflush(stderr);
+
+    while (r->running) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(r->conn->fd, &rfds);
+        struct timeval tv = {0, 100000}; /* 100ms */
+        int sel = select(0, &rfds, NULL, NULL, &tv);
+        if (sel <= 0) continue;
+
+        adb_message_t msg;
+        memset(&msg, 0, sizeof(msg));
+        int ret = adb_recv_msg_conn(r->conn, &msg, pl, ADB_MAX_PAYLOAD, 1);
+        if (ret == 1) {
+            if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
+                /* Relay data to the socketpair */
+                static int frame_count = 0;
+                if (frame_count < 5) {
+                    fprintf(stderr, "RELAY: frame %d, %u bytes\n", frame_count, msg.data_length);
+                    fflush(stderr);
+                }
+                frame_count++;
+                if (msg.data_length > 0) {
+                    int sent = send(r->out_fd, (const char *)pl, msg.data_length, 0);
+                    if (sent <= 0) {
+                        fprintf(stderr, "RELAY: send failed, err=%d\n", SOCKET_ERRNO);
+                        fflush(stderr);
+                    }
+                }
+                adb_send_msg_conn(r->conn, ADB_OKAY, r->chan->local_id,
+                                  r->chan->remote_id, NULL, 0, 1);
+            } else if (msg.command == ADB_CLSE) {
+                break;
+            } else {
+                session_handle_message(r->conn, &msg, pl);
+            }
+        }
+    }
+    free(pl);
+    r->running = 0;
+    return 0;
+}
+
 /* Create a local TCP listener */
 static SOCKET_T create_listener(uint16_t port) {
     SOCKET_T fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -649,20 +736,18 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
             fd_set rfds; FD_ZERO(&rfds); FD_SET((conn)->fd, &rfds); \
             struct timeval tv = {5, 0}; \
             if (select(0, &rfds, NULL, NULL, &tv) > 0) { \
-                adb_message_t msg; uint8_t pl[65536]; \
+                adb_message_t msg; uint8_t *pl = malloc(ADB_MAX_PAYLOAD); \
                 memset(&msg, 0, sizeof(msg)); \
-                int r = adb_recv_msg_conn((conn), &msg, pl, sizeof(pl), 1); \
+                int r = adb_recv_msg_conn((conn), &msg, pl, ADB_MAX_PAYLOAD, 1); \
                 if (r == 1 && msg.command == ADB_WRTE && msg.arg0 == (chan)->remote_id) { \
                     memcpy(vbuf, pl, msg.data_length); \
                     (vbuf_len) = (int)msg.data_length; \
                     (vbuf_pos) = 0; \
                     adb_send_msg_conn((conn), ADB_OKAY, (chan)->local_id, (chan)->remote_id, NULL, 0, 1); \
-                } else if (r == 1 && msg.command == ADB_WRTE) { \
-                    /* WRTE for a different channel (e.g., shell) */ \
-                    session_handle_message((conn), &msg, pl); \
                 } else if (r == 1) { \
                     session_handle_message((conn), &msg, pl); \
                 } \
+                free(pl); \
             } else { \
                 log_error("ADB read timeout"); return false; \
             } \
@@ -701,6 +786,29 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     else if (video_sock->codec_id == 0x68323635) cn = "H.265";
     else if (video_sock->codec_id == 0x00617631) cn = "AV1";
     log_info("Video: %s, %ux%u", cn, video_sock->width, video_sock->height);
+
+    /* Create socketpair to bridge ADB channel → video_socket_read_packet() */
+    SOCKET_T sp[2];
+    if (create_socketpair(sp) < 0) {
+        log_error("Failed to create socketpair for video bridge");
+        return false;
+    }
+    /* sp[0] = read side (for video_socket_read_packet), sp[1] = write side (for relay) */
+    video_sock->fd = sp[0];
+
+    /* Flush any remaining buffered data from metadata reads */
+    if (vbuf_len > vbuf_pos) {
+        send(sp[1], (const char *)vbuf + vbuf_pos, vbuf_len - vbuf_pos, 0);
+    }
+
+    /* Start ADB video relay thread */
+    static adb_relay_t video_relay;
+    video_relay.conn = conn;
+    video_relay.chan = video_chan;
+    video_relay.out_fd = sp[1];
+    video_relay.running = 1;
+    CreateThread(NULL, 0, adb_video_relay_thread, &video_relay, 0, NULL);
+    log_info("Video relay started (ADB channel → socketpair)");
 
     srv->running = true;
     log_info("Server started successfully");
