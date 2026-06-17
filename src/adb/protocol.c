@@ -165,7 +165,7 @@ int adb_recv_msg_tls(void *tls, SOCKET_T fd, adb_message_t *out_hdr,
                      uint8_t *out_payload, int max_payload, int skip_checksum) {
     (void)fd; /* unused when TLS is provided */
 
-    /* Read header via TLS — retry on WANT_READ/WANT_WRITE (tls_recv returns 0) */
+    /* Read header via TLS — return 0 on WANT_READ so caller can retry */
     uint8_t *buf = (uint8_t *)out_hdr;
     size_t total = ADB_MSG_HEADER_SIZE;
     size_t received = 0;
@@ -173,7 +173,7 @@ int adb_recv_msg_tls(void *tls, SOCKET_T fd, adb_message_t *out_hdr,
     while (received < total) {
         int n = tls_recv(tls, buf + received, (int)(total - received));
         if (n < 0) return -1;
-        if (n == 0) continue; /* WANT_READ — retry */
+        if (n == 0) return 0; /* WANT_READ — let caller retry */
         received += n;
     }
 
@@ -194,7 +194,7 @@ int adb_recv_msg_tls(void *tls, SOCKET_T fd, adb_message_t *out_hdr,
         while (received < out_hdr->data_length) {
             int n = tls_recv(tls, out_payload + received, (int)(out_hdr->data_length - received));
             if (n < 0) return -1;
-            if (n == 0) continue; /* WANT_READ — retry */
+            if (n == 0) return 0; /* WANT_READ — let caller retry */
             received += n;
         }
 
