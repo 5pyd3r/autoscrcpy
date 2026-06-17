@@ -22,6 +22,10 @@
         u_long mode = 1;
         return ioctlsocket(s, FIONBIO, &mode);
     }
+    static inline int SET_BLOCK(SOCKET_T s) {
+        u_long mode = 0;
+        return ioctlsocket(s, FIONBIO, &mode);
+    }
 
     #define SOCKET_ERRNO       WSAGetLastError()
     #define WOULDBLOCK_ERR     WSAEWOULDBLOCK

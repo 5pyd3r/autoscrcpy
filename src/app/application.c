@@ -98,6 +98,13 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
     memset(&app->audio_sock, 0, sizeof(app->audio_sock));
     memset(&app->control_sock, 0, sizeof(app->control_sock));
 
+    /* Initialize COM for WASAPI */
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        log_error("Failed to initialize COM: 0x%08x", hr);
+        return false;
+    }
+
     if (!adb_init()) {
         log_error("Failed to initialize ADB");
         return false;
