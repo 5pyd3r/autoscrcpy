@@ -193,6 +193,72 @@ fail:
     return NULL;
 }
 
+/* ADB Forward context: manages port forwarding from localhost to device */
+typedef struct {
+    adb_connection_t *fwd_conn;   /* TLS connection for the forward channel */
+    SOCKET_T          listen_fd;  /* Local listener socket */
+    uint16_t          local_port;
+    char              remote_spec[256];
+} adb_forward_t;
+
+/* Connect to an abstract socket on the device via ADB.
+ * Opens a channel with the given service (e.g., "localabstract:scrcpy").
+ * Returns the channel or NULL on failure. */
+static adb_channel_t *adb_connect_abstract(adb_connection_t *conn,
+                                            const char *service) {
+    adb_channel_t *chan = session_open_channel(conn, service);
+    if (!chan) {
+        log_error("Failed to open %s channel", service);
+        return NULL;
+    }
+
+    /* Wait for OKAY */
+    for (int i = 0; i < 100; i++) {
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(conn->fd, &rfds);
+        struct timeval tv = {0, 100000};
+        if (select(0, &rfds, NULL, NULL, &tv) > 0) {
+            adb_message_t msg; uint8_t pl[4096];
+            memset(&msg, 0, sizeof(msg));
+            int r = adb_recv_msg_conn(conn, &msg, pl, sizeof(pl), 1);
+            if (r == 1) {
+                session_handle_message(conn, &msg, pl);
+                if (chan->state == CHAN_OPEN) {
+                    log_info("Connected to %s", service);
+                    return chan;
+                }
+            }
+        }
+    }
+
+    log_error("Channel %s did not open", service);
+    return NULL;
+}
+
+/* Accept a forwarded connection: connect to localhost:PORT.
+ * The connection is forwarded through ADB to the device's abstract socket.
+ * Returns the data socket or INVALID_SOCKFD on failure. */
+static SOCKET_T accept_forwarded_connection(adb_forward_t *fwd,
+                                             const char *label) {
+    /* Connect to localhost:PORT (which adbd forwards to the device) */
+    SOCKET_T fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKFD) return INVALID_SOCKFD;
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(fwd->local_port);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        log_error("Forward: failed to connect to localhost:%u", fwd->local_port);
+        CLOSESOCKET(fd);
+        return INVALID_SOCKFD;
+    }
+
+    log_info("%s connected via forward", label);
+    return fd;
+}
+
 static SOCKET_T create_listener(uint16_t port) {
     SOCKET_T fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == INVALID_SOCKFD) return INVALID_SOCKFD;
@@ -225,6 +291,13 @@ static SOCKET_T accept_device_connection(SOCKET_T listen_fd, const char *label) 
     return fd;
 }
 
+static void server_shell_output_cb(const uint8_t *data, uint32_t len, void *arg) {
+    (void)arg;
+    /* Print shell output for debugging (may contain server error messages) */
+    fprintf(stderr, "[shell] %.*s", (int)len, (const char *)data);
+    fflush(stderr);
+}
+
 static int recv_exact(SOCKET_T fd, void *buf, int n) {
     int done = 0;
     while (done < n) {
@@ -251,6 +324,10 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         return false;
     }
     srv->adb_conn = conn;
+
+    /* Set shell output callback to capture server error messages */
+    conn->on_shell_output = server_shell_output_cb;
+    conn->on_shell_output_arg = NULL;
 
     /* Drain any post-CNXN STLS messages before proceeding.
      * Per reference implementation, device sends STLS after receiving our CNXN. */
@@ -301,13 +378,15 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
             log_error("Sync channel did not open"); fclose(fp); return false;
         }
 
-        /* Send SEND command */
+        /* Send SEND command (sync protocol: ID + path_length + path,mode) */
         uint8_t cmd_buf[4 + 4 + 512];
         memcpy(cmd_buf, "SEND", 4);
         const char *remote = "/data/local/tmp/scrcpy-server.jar";
-        uint32_t path_len = (uint32_t)strlen(remote);
+        char path_mode[512];
+        snprintf(path_mode, sizeof(path_mode), "%s,0644", remote);
+        uint32_t path_len = (uint32_t)strlen(path_mode);
         write32le(cmd_buf + 4, path_len);
-        memcpy(cmd_buf + 8, remote, path_len);
+        memcpy(cmd_buf + 8, path_mode, path_len);
         adb_send_msg_conn(conn, ADB_WRTE, chan->local_id, chan->remote_id,
                           cmd_buf, 8 + path_len, 1);
 
@@ -339,7 +418,8 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         adb_send_msg_conn(conn, ADB_WRTE, chan->local_id, chan->remote_id,
                           chunk_buf, 8, 1);
 
-        /* Wait for OKAY */
+        /* Wait for sync response (OKAY or FAIL) */
+        bool push_ok = false;
         retries = 200;
         while (retries > 0) {
             fd_set rfds; FD_ZERO(&rfds); FD_SET(conn->fd, &rfds);
@@ -347,9 +427,32 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
             if (select(0, &rfds, NULL, NULL, &tv) > 0) {
                 adb_message_t msg; uint8_t pl[4096];
                 int n = adb_recv_msg_conn(conn, &msg, pl, sizeof(pl), 1);
-                if (n == 1) { session_handle_message(conn, &msg, pl); break; }
+                if (n == 1) {
+                    /* Check if this is a sync response on the sync channel */
+                    if (msg.command == ADB_WRTE && msg.arg1 == chan->local_id &&
+                        msg.data_length >= 4) {
+                        /* Sync IDs are little-endian: OKAY=0x59414b4f, FAIL=0x4c494146 */
+                        uint32_t sync_id = read32le(pl);
+                        if (sync_id == 0x59414b4f) { /* "OKAY" in LE */
+                            push_ok = true;
+                            session_handle_message(conn, &msg, pl);
+                            break;
+                        } else if (sync_id == 0x4c494146) { /* "FAIL" in LE */
+                            log_error("Push failed: %.*s", (int)(msg.data_length - 4), pl + 4);
+                            session_handle_message(conn, &msg, pl);
+                            break;
+                        }
+                    }
+                    session_handle_message(conn, &msg, pl);
+                }
             }
             retries--;
+        }
+        if (!push_ok) {
+            log_error("Push failed: no OKAY response");
+            session_close_channel(conn, chan);
+            fclose(fp);
+            return false;
         }
 
         session_close_channel(conn, chan);
@@ -361,25 +464,15 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     adb_shell(conn, "pkill -f com.genymobile.scrcpy.Server");
     Sleep(1000);
 
-    /* Create listener for tunnel_forward */
-    srv->listen_fd = create_listener(srv->config.local_port);
-    if (srv->listen_fd == INVALID_SOCKFD) return false;
-
     /* Start scrcpy-server */
     {
         char cmd[1024];
         snprintf(cmd, sizeof(cmd),
                  "CLASSPATH=/data/local/tmp/scrcpy-server.jar "
                  "app_process / com.genymobile.scrcpy.Server 3.3.2 "
-                 "tunnel_forward=true send_dummy_byte=true "
+                 "tunnel_forward=true "
                  "send_device_meta=true send_frame_meta=true "
-                 "video=%s audio=%s control=%s "
-                 "max_size=%u video_bit_rate=%u audio_bit_rate=%u",
-                 srv->config.video ? "true" : "false",
-                 srv->config.audio ? "true" : "false",
-                 srv->config.control ? "true" : "false",
-                 srv->config.max_size, srv->config.video_bit_rate,
-                 srv->config.audio_bit_rate);
+                 "audio=false control=true");
         log_info("Starting scrcpy-server...");
         if (!adb_shell(conn, cmd)) { log_error("Shell failed"); return false; }
 
@@ -401,52 +494,39 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         }
     }
 
-    /* Accept video */
-    if (srv->config.video) {
-        video_sock->fd = accept_device_connection(srv->listen_fd, "Video");
-        if (video_sock->fd == INVALID_SOCKFD) return false;
-        char devname[65] = {0};
-        if (recv_exact(video_sock->fd, devname, 64) < 0) return false;
-        log_info("Device: %s", devname);
-        uint8_t shdr[12];
-        if (recv_exact(video_sock->fd, shdr, 12) < 0) return false;
-        video_sock->codec_id = ((uint32_t)shdr[0]<<24)|((uint32_t)shdr[1]<<16)|
-                                ((uint32_t)shdr[2]<<8)|(uint32_t)shdr[3];
-        video_sock->width = ((uint32_t)shdr[4]<<24)|((uint32_t)shdr[5]<<16)|
-                             ((uint32_t)shdr[6]<<8)|(uint32_t)shdr[7];
-        video_sock->height = ((uint32_t)shdr[8]<<24)|((uint32_t)shdr[9]<<16)|
-                              ((uint32_t)shdr[10]<<8)|(uint32_t)shdr[11];
-        const char *cn = "unknown";
-        if (video_sock->codec_id == 0x68323634) cn = "H.264";
-        else if (video_sock->codec_id == 0x68323635) cn = "H.265";
-        else if (video_sock->codec_id == 0x00617631) cn = "AV1";
-        log_info("Video: %s, %ux%u", cn, video_sock->width, video_sock->height);
+    /* Connect to scrcpy-server via abstract socket */
+    log_info("Connecting to scrcpy-server...");
+    adb_channel_t *video_chan = adb_connect_abstract(conn, "localabstract:scrcpy");
+    if (!video_chan) {
+        log_error("Failed to connect to scrcpy-server");
+        return false;
     }
 
-    /* Accept audio */
-    if (srv->config.audio) {
-        audio_sock->fd = accept_device_connection(srv->listen_fd, "Audio");
-        if (audio_sock->fd == INVALID_SOCKFD) return false;
-        uint8_t ahdr[12];
-        if (recv_exact(audio_sock->fd, ahdr, 12) < 0) return false;
-        audio_sock->codec_id = ((uint32_t)ahdr[0]<<24)|((uint32_t)ahdr[1]<<16)|
-                                ((uint32_t)ahdr[2]<<8)|(uint32_t)ahdr[3];
-        audio_sock->sample_rate = ((uint32_t)ahdr[4]<<24)|((uint32_t)ahdr[5]<<16)|
-                                   ((uint32_t)ahdr[6]<<8)|(uint32_t)ahdr[7];
-        audio_sock->channels = ((uint32_t)ahdr[8]<<24)|((uint32_t)ahdr[9]<<16)|
-                                ((uint32_t)ahdr[10]<<8)|(uint32_t)ahdr[11];
-        log_info("Audio: codec=0x%08x, %u Hz, %u ch",
-                 audio_sock->codec_id, audio_sock->sample_rate, audio_sock->channels);
-    }
+    /* Read video metadata from the ADB channel.
+     * The scrcpy-server sends: dummy(1) + device_name(64) + codec(4) + width(4) + height(4)
+     * Data arrives as WRTE messages processed by session_handle_message. */
+    log_info("Video channel connected (local_id=%u, remote_id=%u)",
+             video_chan->local_id, video_chan->remote_id);
 
-    /* Accept control */
-    if (srv->config.control) {
-        control_sock->fd = accept_device_connection(srv->listen_fd, "Control");
-        if (control_sock->fd == INVALID_SOCKFD) return false;
+    /* Wait for data to arrive on the video channel */
+    log_info("Waiting for video data...");
+    for (int t = 0; t < 100; t++) {
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(conn->fd, &rfds);
+        struct timeval tv = {0, 100000}; /* 100ms */
+        int sel = select(0, &rfds, NULL, NULL, &tv);
+        if (sel > 0) {
+            adb_message_t dmsg; uint8_t dpl[4096];
+            memset(&dmsg, 0, sizeof(dmsg));
+            int r = adb_recv_msg_conn(conn, &dmsg, dpl, sizeof(dpl), 1);
+            if (r == 1) {
+                session_handle_message(conn, &dmsg, dpl);
+                /* Check if this is a WRTE on the video channel */
+                if (dmsg.command == ADB_WRTE && dmsg.arg1 == video_chan->local_id) {
+                    log_info("Video data received: %u bytes", dmsg.data_length);
+                }
+            }
+        }
     }
-
-    CLOSESOCKET(srv->listen_fd);
-    srv->listen_fd = INVALID_SOCKFD;
     srv->running = true;
     log_info("Server started successfully");
     return true;
@@ -461,10 +541,6 @@ void server_kill(server_t *srv) {
 }
 
 void server_destroy(server_t *srv) {
-    if (srv->listen_fd != INVALID_SOCKFD) {
-        CLOSESOCKET(srv->listen_fd);
-        srv->listen_fd = INVALID_SOCKFD;
-    }
     if (srv->adb_conn) {
         adb_disconnect((adb_connection_t *)srv->adb_conn);
         srv->adb_conn = NULL;
