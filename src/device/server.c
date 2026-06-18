@@ -320,9 +320,9 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
 
         if (ret == 0) {
             /* WANT_READ — TLS has no complete message yet.
-             * Sleep briefly and retry. Non-blocking socket means tls_recv
-             * returns immediately, no busy-wait. */
-            Sleep(1);
+             * Yield CPU and retry immediately. With non-blocking socket,
+             * tls_recv returns instantly. */
+            SwitchToThread();
             continue;
         }
 
@@ -565,10 +565,12 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  "app_process / com.genymobile.scrcpy.Server 3.3.2 "
                  "tunnel_forward=true "
                  "send_device_meta=true send_frame_meta=true "
-                 "video=%s audio=%s control=%s",
+                 "video=%s audio=%s control=%s "
+                 "max_size=%u max_fps=15 video_bit_rate=2000000",
                  srv->config.video ? "true" : "false",
                  srv->config.audio ? "true" : "false",
-                 srv->config.control ? "true" : "false");
+                 srv->config.control ? "true" : "false",
+                 srv->config.max_size ? srv->config.max_size : 1024);
         log_info("Starting scrcpy-server...");
         if (!adb_shell(conn, cmd)) { log_error("Shell failed"); return false; }
 
