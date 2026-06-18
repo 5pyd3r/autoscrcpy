@@ -279,8 +279,7 @@ static void relay_extract_msg(relay_buf_t *rb, adb_message_t *out_hdr,
     rb->expect = 0;
 }
 
-/* Build and send OKAY ack for a WRTE message.
- * Retries on WANT_WRITE — critical for flow control. */
+/* Send OKAY ack for a WRTE message. Retries on WANT_WRITE. */
 static void relay_send_okay(fwd_relay_t *r) {
     adb_message_t okay;
     okay.command = ADB_OKAY;
@@ -289,19 +288,16 @@ static void relay_send_okay(fwd_relay_t *r) {
     okay.data_length = 0;
     okay.data_check = 0;
     okay.magic = ADB_OKAY ^ 0xFFFFFFFF;
-    /* Retry loop for non-blocking TLS */
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < 200; i++) {
         int n = tls_send(r->adb_conn->tls_ctx, &okay, ADB_MSG_HEADER_SIZE);
-        if (n > 0) return; /* sent */
-        if (n < 0) return; /* error — best effort */
-        /* WANT_WRITE — sleep briefly and retry */
-        Sleep(1);
+        if (n > 0) return;
+        if (n < 0) return;
+        SwitchToThread(); /* yield on WANT_WRITE */
     }
 }
 
-/* Relay thread: reads ADB WRTE from TLS, sends payload to local socket, acks OKAY.
- * Uses non-blocking TLS with select() for efficient I/O waiting.
- * Data flow mirrors official adb-server: WRTE recv → extract payload → send to local → OKAY ack. */
+/* Relay thread: ADB WRTE → extract payload → send to local socket → OKAY ack.
+ * Zero blocking: non-blocking TLS, no Sleep, no logging in hot path. */
 static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
     fwd_relay_t *r = (fwd_relay_t *)arg;
     uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
@@ -309,35 +305,16 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
     rb.buf = malloc(ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
     rb.used = 0; rb.hdr_done = 0; rb.expect = 0;
     if (!pl || !rb.buf) { free(pl); free(rb.buf); return 0; }
-    int cnt = 0;
-    SOCKET_T raw_fd = r->adb_conn->fd;
 
     while (r->running) {
-        /* Try to read from TLS layer (may have buffered data) */
         int ret = relay_try_recv(r->adb_conn->tls_ctx, &rb);
+        if (ret < 0) break;
+        if (ret == 0) { SwitchToThread(); continue; }
 
-        if (ret < 0) break; /* error */
-
-        if (ret == 0) {
-            /* WANT_READ — TLS has no complete message yet.
-             * Yield CPU and retry immediately. With non-blocking socket,
-             * tls_recv returns instantly. */
-            SwitchToThread();
-            continue;
-        }
-
-        /* Complete message — extract and process */
         adb_message_t msg;
         relay_extract_msg(&rb, &msg, pl, ADB_MAX_PAYLOAD);
 
         if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
-            /* Data from device → send to local socket → OKAY ack.
-             * OKAY must be sent promptly for flow control (one WRTE in-flight). */
-            cnt++;
-            if (cnt <= 5 || cnt % 300 == 0) {
-                fprintf(stderr, "R[%u]:#%d %uB\n", r->chan->remote_id, cnt, msg.data_length);
-                fflush(stderr);
-            }
             if (msg.data_length > 0) {
                 send(r->local_fd, (const char *)pl, msg.data_length, 0);
             }
@@ -345,7 +322,6 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
         } else if (msg.command == ADB_CLSE) {
             break;
         } else if (msg.command == ADB_OKAY) {
-            /* Channel open confirmation */
             for (int i = 0; i < r->adb_conn->channel_count; i++) {
                 if (r->adb_conn->channels[i].local_id == msg.arg1) {
                     r->adb_conn->channels[i].remote_id = msg.arg0;
@@ -354,7 +330,6 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
                 }
             }
         }
-        /* Ignore other messages (STLS re-sends, etc.) */
     }
 
     free(pl);
@@ -566,7 +541,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  "tunnel_forward=true "
                  "send_device_meta=true send_frame_meta=true "
                  "video=%s audio=%s control=%s "
-                 "max_size=%u max_fps=15 video_bit_rate=2000000",
+                 "max_size=%u max_fps=1 video_bit_rate=500000",
                  srv->config.video ? "true" : "false",
                  srv->config.audio ? "true" : "false",
                  srv->config.control ? "true" : "false",
