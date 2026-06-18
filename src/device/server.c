@@ -223,57 +223,78 @@ static int create_socketpair(SOCKET_T fds[2]) {
     return 0;
 }
 
-/* ADB channel → socket relay thread */
+/* Forward relay context: each forwarded connection has its own TLS to adbd */
 typedef struct {
-    adb_connection_t *conn;
-    adb_channel_t    *chan;
-    SOCKET_T          out_fd;   /* write side of socketpair */
+    adb_connection_t *adb_conn;   /* Independent TLS connection to adbd */
+    adb_channel_t    *chan;       /* ADB channel for localabstract:scrcpy */
+    SOCKET_T          local_fd;   /* Local socket (client side) */
     volatile int      running;
-} adb_relay_t;
+} fwd_relay_t;
 
-static DWORD WINAPI adb_video_relay_thread(LPVOID arg) {
-    adb_relay_t *r = (adb_relay_t *)arg;
-    /* Allocate large buffer for video frames (up to ADB_MAX_PAYLOAD = 1MB) */
+/* Bidirectional relay: ADB channel ↔ local socket.
+ * Device→Local: WRTE from adbd → send() to local → OKAY ack
+ * Local→Device: recv() from local → WRTE to adbd */
+static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
+    fwd_relay_t *r = (fwd_relay_t *)arg;
     uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
     if (!pl) return 0;
-    fprintf(stderr, "RELAY: thread started, remote_id=%u\n", r->chan->remote_id);
+    fprintf(stderr, "RELAY: started, remote_id=%u\n", r->chan->remote_id);
     fflush(stderr);
 
     while (r->running) {
-        /* Read directly from TLS — adb_recv_msg_tls returns 0 on WANT_READ */
+        /* Read from ADB connection directly (tls_recv returns 0 on WANT_READ) */
         adb_message_t msg;
         memset(&msg, 0, sizeof(msg));
-        int ret = adb_recv_msg_conn(r->conn, &msg, pl, ADB_MAX_PAYLOAD, 1);
+        int ret = adb_recv_msg_conn(r->adb_conn, &msg, pl, ADB_MAX_PAYLOAD, 1);
         if (ret == 0) {
-            /* WANT_READ — no data available, sleep briefly and retry */
+            /* WANT_READ — check local socket, then retry */
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(r->local_fd, &rfds);
+            struct timeval tv = {0, 0};
+            if (select(0, &rfds, NULL, NULL, &tv) > 0) {
+                uint8_t buf[65536];
+                int n = recv(r->local_fd, (char *)buf, sizeof(buf), 0);
+                if (n > 0) {
+                    adb_send_msg_conn(r->adb_conn, ADB_WRTE, r->chan->local_id,
+                                      r->chan->remote_id, buf, (uint32_t)n, 1);
+                }
+            }
             Sleep(1);
             continue;
         }
         if (ret == 1) {
             if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
-                /* Relay data to the socketpair */
-                static int frame_count = 0;
-                frame_count++;
-                if (frame_count <= 5 || frame_count % 100 == 0) {
-                    fprintf(stderr, "RELAY: frame %d, %u bytes\n", frame_count, msg.data_length);
+                /* Data from device → relay to local socket */
+                static int cnt = 0;
+                cnt++;
+                if (cnt <= 5 || cnt % 100 == 0) {
+                    fprintf(stderr, "RELAY: #%d, %u bytes\n", cnt, msg.data_length);
                     fflush(stderr);
                 }
                 if (msg.data_length > 0) {
-                    int sent = send(r->out_fd, (const char *)pl, msg.data_length, 0);
-                    if (sent <= 0) {
-                        fprintf(stderr, "RELAY: send failed, err=%d\n", SOCKET_ERRNO);
-                        fflush(stderr);
-                    }
+                    send(r->local_fd, (const char *)pl, msg.data_length, 0);
                 }
-                adb_send_msg_conn(r->conn, ADB_OKAY, r->chan->local_id,
+                int ack = adb_send_msg_conn(r->adb_conn, ADB_OKAY, r->chan->local_id,
                                   r->chan->remote_id, NULL, 0, 1);
+                if (cnt <= 5) {
+                    fprintf(stderr, "RELAY: OKAY ack=%d\n", ack);
+                    fflush(stderr);
+                }
             } else if (msg.command == ADB_CLSE) {
                 break;
-            } else {
-                session_handle_message(r->conn, &msg, pl);
+            } else if (msg.command == ADB_OKAY) {
+                for (int i = 0; i < r->adb_conn->channel_count; i++) {
+                    if (r->adb_conn->channels[i].local_id == msg.arg1) {
+                        r->adb_conn->channels[i].remote_id = msg.arg0;
+                        r->adb_conn->channels[i].state = CHAN_OPEN;
+                        break;
+                    }
+                }
             }
         }
     }
+
     free(pl);
     r->running = 0;
     return 0;
@@ -298,169 +319,6 @@ static SOCKET_T create_listener(uint16_t port) {
     }
     log_info("Listening on 127.0.0.1:%u", port);
     return fd;
-}
-
-/* Forward relay context: one per forwarded connection (video/audio/control).
- * Each relay has its own TLS connection to adbd and a local socket pair. */
-typedef struct fwd_relay {
-    adb_connection_t *adb_conn;   /* Independent TLS connection to adbd */
-    adb_channel_t    *chan;       /* ADB channel for the remote spec */
-    SOCKET_T          local_fd;   /* Local socket (server side of the pair) */
-    volatile int      running;
-} fwd_relay_t;
-
-/* Forward relay thread: bidirectional data relay between local socket and ADB channel.
- * Device→Local: WRTE from adbd → send() to local socket → OKAY ack
- * Local→Device: recv() from local socket → WRTE to adbd */
-static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
-    fwd_relay_t *relay = (fwd_relay_t *)arg;
-    adb_connection_t *conn = relay->adb_conn;
-    adb_channel_t *chan = relay->chan;
-    SOCKET_T local_fd = relay->local_fd;
-
-    while (relay->running) {
-        /* Try to read from ADB connection (non-blocking via SO_RCVTIMEO) */
-
-        /* ADB connection readable → read message → relay to local */
-        {
-            adb_message_t msg;
-            uint8_t pl[65536];
-            memset(&msg, 0, sizeof(msg));
-            int r = adb_recv_msg_conn(conn, &msg, pl, sizeof(pl), 1);
-            if (r > 0) {
-                if (msg.command == ADB_WRTE && msg.arg0 == chan->remote_id) {
-                    /* Data from device → send to local socket */
-                    if (msg.data_length > 0) {
-                        fprintf(stderr, "RELAY: WRTE %u bytes → local\n", msg.data_length);
-                        fflush(stderr);
-                        send(local_fd, (const char *)pl, msg.data_length, 0);
-                    }
-                    /* ACK with OKAY */
-                    int ack = adb_send_msg_conn(conn, ADB_OKAY, chan->local_id,
-                                      chan->remote_id, NULL, 0, 1);
-                    fprintf(stderr, "RELAY: OKAY ack=%d\n", ack); fflush(stderr);
-                } else if (msg.command == ADB_CLSE) {
-                    break; /* device closed channel */
-                } else if (msg.command == ADB_OKAY) {
-                    /* Update remote_id if needed */
-                    for (int i = 0; i < conn->channel_count; i++) {
-                        if (conn->channels[i].local_id == msg.arg1) {
-                            conn->channels[i].remote_id = msg.arg0;
-                            conn->channels[i].state = CHAN_OPEN;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        /* Try to read from local socket (non-blocking) */
-        {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(local_fd, &rfds);
-            struct timeval tv = {0, 0};
-            if (select(0, &rfds, NULL, NULL, &tv) > 0) {
-                uint8_t buf[65536];
-                int n = recv(local_fd, (char *)buf, sizeof(buf), 0);
-                if (n > 0) {
-                    adb_send_msg_conn(conn, ADB_WRTE, chan->local_id, chan->remote_id,
-                                      buf, (uint32_t)n, 1);
-                }
-            }
-        }
-    }
-
-    relay->running = 0;
-    return 0;
-}
-
-/* Create a forwarded connection: connect to local listener, create new TLS
- * connection to adbd, open channel with remote_spec, start relay thread.
- * Returns the client-side socket for the caller to use. */
-static SOCKET_T create_forwarded_connection(const char *host, uint16_t adb_port,
-                                             SOCKET_T listen_fd, uint16_t local_port,
-                                             const char *remote_spec,
-                                             const char *label,
-                                             fwd_relay_t **out_relay) {
-    /* 1. Connect to local listener (client side) */
-    SOCKET_T client_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (client_fd == INVALID_SOCKFD) return INVALID_SOCKFD;
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(local_port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(client_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        CLOSESOCKET(client_fd);
-        return INVALID_SOCKFD;
-    }
-
-    /* 2. Accept on listener (server side) → this is the local socket for relay */
-    struct sockaddr_in ca; int cl = sizeof(ca);
-    SOCKET_T server_fd = accept(listen_fd, (struct sockaddr *)&ca, &cl);
-    if (server_fd == INVALID_SOCKFD) {
-        CLOSESOCKET(client_fd);
-        return INVALID_SOCKFD;
-    }
-
-    /* 3. Create new TLS connection to adbd */
-    adb_connection_t *adb_conn = do_adb_connect(host, adb_port);
-    if (!adb_conn) {
-        log_error("Forward: failed to connect to adbd for %s", label);
-        CLOSESOCKET(client_fd);
-        CLOSESOCKET(server_fd);
-        return INVALID_SOCKFD;
-    }
-
-    /* 4. Open channel with remote_spec (e.g., "localabstract:scrcpy") */
-    adb_channel_t *chan = session_open_channel(adb_conn, remote_spec);
-    if (!chan) {
-        log_error("Forward: failed to open channel for %s", label);
-        adb_disconnect(adb_conn);
-        CLOSESOCKET(client_fd);
-        CLOSESOCKET(server_fd);
-        return INVALID_SOCKFD;
-    }
-
-    /* 5. Wait for OKAY */
-    for (int i = 0; i < 200; i++) {
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(adb_conn->fd, &rfds);
-        struct timeval tv = {0, 100000};
-        if (select(0, &rfds, NULL, NULL, &tv) > 0) {
-            adb_message_t msg; uint8_t pl[4096];
-            memset(&msg, 0, sizeof(msg));
-            int r = adb_recv_msg_conn(adb_conn, &msg, pl, sizeof(pl), 1);
-            if (r == 1) {
-                session_handle_message(adb_conn, &msg, pl);
-                if (chan->state == CHAN_OPEN) break;
-            }
-        }
-    }
-    if (chan->state != CHAN_OPEN) {
-        log_error("Forward: %s channel did not open", label);
-        adb_disconnect(adb_conn);
-        CLOSESOCKET(client_fd);
-        CLOSESOCKET(server_fd);
-        return INVALID_SOCKFD;
-    }
-    log_info("%s connected (remote_id=%u)", label, chan->remote_id);
-
-    /* 6. Set socket timeout for the relay thread (100ms) */
-    DWORD tv_ms = 100;
-    setsockopt(adb_conn->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_ms, sizeof(tv_ms));
-
-    /* 7. Start relay thread */
-    fwd_relay_t *relay = calloc(1, sizeof(fwd_relay_t));
-    relay->adb_conn = adb_conn;
-    relay->chan = chan;
-    relay->local_fd = server_fd;
-    relay->running = 1;
-    CreateThread(NULL, 0, fwd_relay_thread, relay, 0, NULL);
-    *out_relay = relay;
-
-    /* Return the client side socket for the caller to use */
-    return client_fd;
 }
 
 static void server_shell_output_cb(const uint8_t *data, uint32_t len, void *arg) {
@@ -636,13 +494,6 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     adb_shell(conn, "pkill -f com.genymobile.scrcpy.Server");
     Sleep(1000);
 
-    /* Create local listener for forward connections */
-    SOCKET_T listen_fd = create_listener(srv->config.local_port);
-    if (listen_fd == INVALID_SOCKFD) {
-        log_error("Failed to create listener on port %u", srv->config.local_port);
-        return false;
-    }
-
     /* Start scrcpy-server */
     {
         char cmd[1024];
@@ -653,7 +504,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  "send_device_meta=true send_frame_meta=true "
                  "audio=false control=true");
         log_info("Starting scrcpy-server...");
-        if (!adb_shell(conn, cmd)) { log_error("Shell failed"); CLOSESOCKET(listen_fd); return false; }
+        if (!adb_shell(conn, cmd)) { log_error("Shell failed"); return false; }
 
         /* Drain pending messages (OKAY for shell channel, WRTE with server output) */
         log_info("Waiting for scrcpy-server to start...");
@@ -669,111 +520,93 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         }
     }
 
-    /* Connect to scrcpy-server via ADB channel on the main connection.
-     * Open "localabstract:scrcpy" channel — adbd connects to the abstract socket
-     * and relays data as WRTE messages. We read them directly. */
-    adb_channel_t *video_chan = session_open_channel(conn, "localabstract:scrcpy");
-    if (!video_chan) {
-        log_error("Failed to open video channel");
+    /* Create local listener for forward connections */
+    SOCKET_T listen_fd = create_listener(srv->config.local_port);
+    if (listen_fd == INVALID_SOCKFD) {
+        log_error("Failed to create listener on port %u", srv->config.local_port);
         return false;
     }
 
-    /* Wait for OKAY */
-    for (int i = 0; i < 200; i++) {
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(conn->fd, &rfds);
-        struct timeval tv = {0, 100000};
-        if (select(0, &rfds, NULL, NULL, &tv) > 0) {
-            adb_message_t msg; uint8_t pl[4096];
-            memset(&msg, 0, sizeof(msg));
-            int r = adb_recv_msg_conn(conn, &msg, pl, sizeof(pl), 1);
-            if (r == 1) {
-                session_handle_message(conn, &msg, pl);
-                if (video_chan->state == CHAN_OPEN) break;
-            }
-        }
-    }
-    if (video_chan->state != CHAN_OPEN) {
-        log_error("Video channel did not open");
-        return false;
-    }
-    log_info("Video channel open (local_id=%u, remote_id=%u)",
-             video_chan->local_id, video_chan->remote_id);
-
-    /* Open control channel (scrcpy-server expects multiple connections) */
-    adb_channel_t *ctrl_chan = session_open_channel(conn, "localabstract:scrcpy");
-    if (!ctrl_chan) {
-        log_error("Failed to open control channel");
-        return false;
-    }
-    for (int i = 0; i < 200; i++) {
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(conn->fd, &rfds);
-        struct timeval tv = {0, 100000};
-        if (select(0, &rfds, NULL, NULL, &tv) > 0) {
-            adb_message_t msg; uint8_t pl[4096];
-            memset(&msg, 0, sizeof(msg));
-            int r = adb_recv_msg_conn(conn, &msg, pl, sizeof(pl), 1);
-            if (r == 1) {
-                session_handle_message(conn, &msg, pl);
-                if (ctrl_chan->state == CHAN_OPEN) break;
-            }
-        }
-    }
-    if (ctrl_chan->state == CHAN_OPEN) {
-        log_info("Control channel open (local_id=%u, remote_id=%u)",
-                 ctrl_chan->local_id, ctrl_chan->remote_id);
-    }
-
-    /* Read video metadata directly from the ADB channel.
-     * scrcpy-server sends: dummy(1) + device_name(64) + codec(4) + width(4) + height(4)
-     * Data arrives as WRTE messages. We buffer extra bytes across reads. */
-    uint8_t vbuf[65536];
-    int vbuf_len = 0, vbuf_pos = 0;
-
-    /* Helper: read one WRTE from the video channel, buffer the payload */
-    #define ADB_FILL_BUF(conn, chan, vbuf, vbuf_len, vbuf_pos) do { \
-        while ((vbuf_len) - (vbuf_pos) <= 0) { \
-            fd_set rfds; FD_ZERO(&rfds); FD_SET((conn)->fd, &rfds); \
-            struct timeval tv = {5, 0}; \
-            if (select(0, &rfds, NULL, NULL, &tv) > 0) { \
-                adb_message_t msg; uint8_t *pl = malloc(ADB_MAX_PAYLOAD); \
-                memset(&msg, 0, sizeof(msg)); \
-                int r = adb_recv_msg_conn((conn), &msg, pl, ADB_MAX_PAYLOAD, 1); \
-                if (r == 1 && msg.command == ADB_WRTE && msg.arg0 == (chan)->remote_id) { \
-                    memcpy(vbuf, pl, msg.data_length); \
-                    (vbuf_len) = (int)msg.data_length; \
-                    (vbuf_pos) = 0; \
-                    adb_send_msg_conn((conn), ADB_OKAY, (chan)->local_id, (chan)->remote_id, NULL, 0, 1); \
-                } else if (r == 1) { \
-                    session_handle_message((conn), &msg, pl); \
+    /* Helper: create a forwarded connection to scrcpy-server.
+     * 1. Connect to local listener (client side)
+     * 2. Accept on listener (server side)
+     * 3. Create new TLS connection to adbd
+     * 4. Open "localabstract:scrcpy" channel
+     * 5. Start bidirectional relay thread
+     * Returns client side socket for the caller. */
+    #define CREATE_FWD(label, out_relay) do { \
+        SOCKET_T _client = socket(AF_INET, SOCK_STREAM, 0); \
+        struct sockaddr_in _a; memset(&_a, 0, sizeof(_a)); \
+        _a.sin_family = AF_INET; _a.sin_port = htons(srv->config.local_port); \
+        _a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); \
+        if (connect(_client, (struct sockaddr *)&_a, sizeof(_a)) < 0) { \
+            log_error("Forward " label ": connect failed"); CLOSESOCKET(_client); \
+            CLOSESOCKET(listen_fd); return false; \
+        } \
+        struct sockaddr_in _ca; int _cl = sizeof(_ca); \
+        SOCKET_T _server = accept(listen_fd, (struct sockaddr *)&_ca, &_cl); \
+        if (_server == INVALID_SOCKFD) { \
+            log_error("Forward " label ": accept failed"); CLOSESOCKET(_client); \
+            CLOSESOCKET(listen_fd); return false; \
+        } \
+        adb_connection_t *_fwd_conn = do_adb_connect(device_host, device_port); \
+        if (!_fwd_conn) { \
+            log_error("Forward " label ": adbd connect failed"); \
+            CLOSESOCKET(_client); CLOSESOCKET(_server); \
+            CLOSESOCKET(listen_fd); return false; \
+        } \
+        adb_channel_t *_chan = session_open_channel(_fwd_conn, "localabstract:scrcpy"); \
+        if (!_chan) { \
+            log_error("Forward " label ": channel open failed"); \
+            adb_disconnect(_fwd_conn); CLOSESOCKET(_client); CLOSESOCKET(_server); \
+            CLOSESOCKET(listen_fd); return false; \
+        } \
+        for (int _i = 0; _i < 200; _i++) { \
+            fd_set _rfds; FD_ZERO(&_rfds); FD_SET(_fwd_conn->fd, &_rfds); \
+            struct timeval _tv = {0, 100000}; \
+            if (select(0, &_rfds, NULL, NULL, &_tv) > 0) { \
+                adb_message_t _m; uint8_t _p[4096]; memset(&_m, 0, sizeof(_m)); \
+                if (adb_recv_msg_conn(_fwd_conn, &_m, _p, sizeof(_p), 1) == 1) { \
+                    session_handle_message(_fwd_conn, &_m, _p); \
+                    if (_chan->state == CHAN_OPEN) break; \
                 } \
-                free(pl); \
-            } else { \
-                log_error("ADB read timeout"); return false; \
             } \
         } \
-    } while(0)
-
-    /* Helper: copy n bytes from the buffer, refill as needed */
-    #define ADB_READ_N(conn, chan, dest, n, vbuf, vbuf_len, vbuf_pos) do { \
-        int _done = 0; \
-        while (_done < (n)) { \
-            ADB_FILL_BUF(conn, chan, vbuf, vbuf_len, vbuf_pos); \
-            int _avail = (vbuf_len) - (vbuf_pos); \
-            int _copy = _avail < ((n) - _done) ? _avail : ((n) - _done); \
-            memcpy((dest) + _done, vbuf + (vbuf_pos), _copy); \
-            (vbuf_pos) += _copy; \
-            _done += _copy; \
+        if (_chan->state != CHAN_OPEN) { \
+            log_error("Forward " label ": channel did not open"); \
+            adb_disconnect(_fwd_conn); CLOSESOCKET(_client); CLOSESOCKET(_server); \
+            CLOSESOCKET(listen_fd); return false; \
         } \
+        log_info(label " connected (remote_id=%u)", _chan->remote_id); \
+        out_relay = calloc(1, sizeof(fwd_relay_t)); \
+        out_relay->adb_conn = _fwd_conn; \
+        out_relay->chan = _chan; \
+        out_relay->local_fd = _server; \
+        out_relay->running = 1; \
+        CreateThread(NULL, 0, fwd_relay_thread, out_relay, 0, NULL); \
+        /* Return client side via the macro caller's variable */ \
+        _fwd_client_fd = _client; \
     } while(0)
 
-    /* Read device name (64 bytes) — no dummy byte in scrcpy-server 3.3.2 */
-    char devname[65] = {0};
-    ADB_READ_N(conn, video_chan, (uint8_t *)devname, 64, vbuf, vbuf_len, vbuf_pos);
+    /* Connect video stream */
+    SOCKET_T _fwd_client_fd = INVALID_SOCKFD;
+    fwd_relay_t *video_relay = NULL;
+    CREATE_FWD("Video", video_relay);
+    video_sock->fd = _fwd_client_fd;
+
+    /* Read video metadata from the raw TCP socket (forwarded by relay) */
+    uint8_t devname[65] = {0};
+    if (recv_exact(video_sock->fd, devname, 64) < 0) {
+        log_error("Failed to read device name");
+        CLOSESOCKET(listen_fd); return false;
+    }
     log_info("Device: %s", devname);
 
-    /* Read stream header: codec(4) + width(4) + height(4) */
     uint8_t shdr[12];
-    ADB_READ_N(conn, video_chan, shdr, 12, vbuf, vbuf_len, vbuf_pos);
+    if (recv_exact(video_sock->fd, shdr, 12) < 0) {
+        log_error("Failed to read stream header");
+        CLOSESOCKET(listen_fd); return false;
+    }
     video_sock->codec_id = ((uint32_t)shdr[0]<<24)|((uint32_t)shdr[1]<<16)|
                             ((uint32_t)shdr[2]<<8)|(uint32_t)shdr[3];
     video_sock->width = ((uint32_t)shdr[4]<<24)|((uint32_t)shdr[5]<<16)|
@@ -786,29 +619,12 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     else if (video_sock->codec_id == 0x00617631) cn = "AV1";
     log_info("Video: %s, %ux%u", cn, video_sock->width, video_sock->height);
 
-    /* Create socketpair to bridge ADB channel → video_socket_read_packet() */
-    SOCKET_T sp[2];
-    if (create_socketpair(sp) < 0) {
-        log_error("Failed to create socketpair for video bridge");
-        return false;
-    }
-    /* sp[0] = read side (for video_socket_read_packet), sp[1] = write side (for relay) */
-    video_sock->fd = sp[0];
+    /* Connect control stream */
+    fwd_relay_t *ctrl_relay = NULL;
+    CREATE_FWD("Control", ctrl_relay);
+    control_sock->fd = _fwd_client_fd;
 
-    /* Flush any remaining buffered data from metadata reads */
-    if (vbuf_len > vbuf_pos) {
-        send(sp[1], (const char *)vbuf + vbuf_pos, vbuf_len - vbuf_pos, 0);
-    }
-
-    /* Start ADB video relay thread */
-    static adb_relay_t video_relay;
-    video_relay.conn = conn;
-    video_relay.chan = video_chan;
-    video_relay.out_fd = sp[1];
-    video_relay.running = 1;
-    CreateThread(NULL, 0, adb_video_relay_thread, &video_relay, 0, NULL);
-    log_info("Video relay started (ADB channel → socketpair)");
-
+    CLOSESOCKET(listen_fd);
     srv->running = true;
     log_info("Server started successfully");
     return true;
