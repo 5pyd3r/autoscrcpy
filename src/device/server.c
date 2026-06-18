@@ -247,19 +247,9 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
         memset(&msg, 0, sizeof(msg));
         int ret = adb_recv_msg_conn(r->adb_conn, &msg, pl, ADB_MAX_PAYLOAD, 1);
         if (ret == 0) {
-            /* WANT_READ — check local socket, then retry */
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(r->local_fd, &rfds);
-            struct timeval tv = {0, 0};
-            if (select(0, &rfds, NULL, NULL, &tv) > 0) {
-                uint8_t buf[65536];
-                int n = recv(r->local_fd, (char *)buf, sizeof(buf), 0);
-                if (n > 0) {
-                    adb_send_msg_conn(r->adb_conn, ADB_WRTE, r->chan->local_id,
-                                      r->chan->remote_id, buf, (uint32_t)n, 1);
-                }
-            }
+            /* WANT_READ — no ADB data, sleep briefly and retry.
+             * Do NOT read from local_fd here — that would consume data
+             * meant for the video_socket_read_packet() consumer. */
             Sleep(1);
             continue;
         }
@@ -273,6 +263,12 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
                     fflush(stderr);
                 }
                 if (msg.data_length > 0) {
+                    if (cnt <= 8) {
+                        fprintf(stderr, "RELAY: data[%u]=[%02x %02x %02x %02x %02x %02x ...]\n",
+                                msg.data_length, pl[0], pl[1], pl[2], pl[3], pl[4],
+                                msg.data_length > 5 ? pl[5] : 0);
+                        fflush(stderr);
+                    }
                     send(r->local_fd, (const char *)pl, msg.data_length, 0);
                 }
                 int ack = adb_send_msg_conn(r->adb_conn, ADB_OKAY, r->chan->local_id,
@@ -633,12 +629,10 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     video_sock->codec_id = ((uint32_t)codec_buf[0]<<24)|((uint32_t)codec_buf[1]<<16)|
                             ((uint32_t)codec_buf[2]<<8)|(uint32_t)codec_buf[3];
 
-    /* Read stream metadata: width(4BE) + height(4BE).
-     * scrcpy-server 3.3.2 sends codec(4)+width(4)+height(4) = 12 bytes total.
-     * No separate session header marker. */
+    /* Read width(4BE) + height(4BE) = 8 bytes */
     uint8_t meta[8];
     if (recv_exact(video_sock->fd, meta, 8) < 0) {
-        log_error("Failed to read stream metadata");
+        log_error("Failed to read width/height");
         return false;
     }
     video_sock->width = ((uint32_t)meta[0]<<24)|((uint32_t)meta[1]<<16)|

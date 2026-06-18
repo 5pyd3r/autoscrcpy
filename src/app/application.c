@@ -26,10 +26,23 @@ static DWORD WINAPI video_receiver_thread(LPVOID arg) {
             break;
         }
 
+        /* Session packets have no payload — skip */
+        if (!data || size == 0) {
+            free(data);
+            continue;
+        }
+
         /* Decode and render */
         video_frame_t frame;
         memset(&frame, 0, sizeof(frame));
         if (video_decoder_decode(app->video_decoder, data, size, &frame)) {
+            static int render_count = 0;
+            render_count++;
+            if (render_count <= 3 || render_count % 300 == 0) {
+                fprintf(stderr, "VIDEO: rendered frame %d, %ux%u\n",
+                        render_count, frame.width, frame.height);
+                fflush(stderr);
+            }
             d3d_context_begin_frame(&app->d3d_ctx);
             video_renderer_render(&app->renderer, &frame);
             d3d_context_end_frame(&app->d3d_ctx);
