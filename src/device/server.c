@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <process.h>
 
 bool server_init(server_t *srv, const struct server_config *config) {
     srv->config = *config;
@@ -231,67 +232,132 @@ typedef struct {
     volatile int      running;
 } fwd_relay_t;
 
+/* Read one complete ADB message over TLS, looping on WANT_READ.
+ * Unlike adb_recv_msg_tls which loses partial data on WANT_READ,
+ * this function accumulates data internally until a full message arrives.
+ * `buf` must be at least ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD bytes,
+ * allocated by the caller (per-thread to avoid races).
+ * Returns: 1 = message complete, 0 = no data at all, -1 = error. */
+static int relay_recv_msg(void *tls_ctx, adb_message_t *out_hdr,
+                          uint8_t *out_pl, int max_pl,
+                          uint8_t *buf, int buf_size) {
+    int used = 0, hdr_done = 0, expect = 0;
+    int empty_reads = 0;
+
+    for (;;) {
+        int n = tls_recv(tls_ctx, buf + used, buf_size - used);
+        if (n < 0) return -1;
+        if (n == 0) {
+            /* WANT_READ or timeout — no data available right now */
+            if (used == 0) return 0; /* No partial data → caller can retry later */
+            empty_reads++;
+            if (empty_reads > 20) return -1; /* Stuck too long with partial data */
+            continue;
+        }
+        empty_reads = 0;
+        used += n;
+
+        if (!hdr_done && used >= ADB_MSG_HEADER_SIZE) {
+            memcpy(out_hdr, buf, ADB_MSG_HEADER_SIZE);
+            if (out_hdr->magic != (out_hdr->command ^ 0xFFFFFFFF)) return -1;
+            hdr_done = 1;
+            expect = (int)out_hdr->data_length;
+        }
+        if (!hdr_done) continue;
+        if (used < ADB_MSG_HEADER_SIZE + expect) continue;
+
+        /* Complete message received */
+        if (expect > 0 && out_pl) {
+            int cl = expect > max_pl ? max_pl : expect;
+            memcpy(out_pl, buf + ADB_MSG_HEADER_SIZE, cl);
+        }
+        return 1;
+    }
+}
+
 /* Bidirectional relay: ADB channel ↔ local socket.
- * Device→Local: WRTE from adbd → send() to local → OKAY ack
- * Local→Device: recv() from local → WRTE to adbd */
+ * Device→Local: WRTE from adbd → send() to local → OKAY ack */
 static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
     fwd_relay_t *r = (fwd_relay_t *)arg;
+    /* Per-thread buffers — must not be shared across threads */
     uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
-    if (!pl) return 0;
-    fprintf(stderr, "RELAY: started, remote_id=%u\n", r->chan->remote_id);
-    fflush(stderr);
+    uint8_t *recv_buf = malloc(ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
+    if (!pl || !recv_buf) { free(pl); free(recv_buf); return 0; }
+    int cnt = 0;
+    int idle = 0;
 
     while (r->running) {
-        /* Read from ADB connection directly (tls_recv returns 0 on WANT_READ) */
         adb_message_t msg;
         memset(&msg, 0, sizeof(msg));
-        int ret = adb_recv_msg_conn(r->adb_conn, &msg, pl, ADB_MAX_PAYLOAD, 1);
+        int ret = relay_recv_msg(r->adb_conn->tls_ctx, &msg, pl, ADB_MAX_PAYLOAD,
+                                 recv_buf, ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
+        if (ret < 0) {
+            fprintf(stderr, "RELAY[%u]: recv error after %d msgs, idle=%d\n",
+                    r->chan->remote_id, cnt, idle);
+            fflush(stderr);
+            break;
+        }
         if (ret == 0) {
-            /* WANT_READ — no ADB data, sleep briefly and retry.
-             * Do NOT read from local_fd here — that would consume data
-             * meant for the video_socket_read_packet() consumer. */
+            idle++;
+            if (idle == 1 || idle % 1000 == 0) {
+                fprintf(stderr, "RELAY[%u]: idle=%d (no data)\n", r->chan->remote_id, idle);
+                fflush(stderr);
+            }
             Sleep(1);
             continue;
         }
-        if (ret == 1) {
-            if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
-                /* Data from device → relay to local socket */
-                static int cnt = 0;
-                cnt++;
-                if (cnt <= 5 || cnt % 100 == 0) {
-                    fprintf(stderr, "RELAY: #%d, %u bytes\n", cnt, msg.data_length);
-                    fflush(stderr);
-                }
-                if (msg.data_length > 0) {
-                    if (cnt <= 8) {
-                        fprintf(stderr, "RELAY: data[%u]=[%02x %02x %02x %02x %02x %02x ...]\n",
-                                msg.data_length, pl[0], pl[1], pl[2], pl[3], pl[4],
-                                msg.data_length > 5 ? pl[5] : 0);
-                        fflush(stderr);
-                    }
-                    send(r->local_fd, (const char *)pl, msg.data_length, 0);
-                }
-                int ack = adb_send_msg_conn(r->adb_conn, ADB_OKAY, r->chan->local_id,
-                                  r->chan->remote_id, NULL, 0, 1);
+        idle = 0;
+        /* ret == 1: got a message */
+        if (cnt < 10 || msg.command != ADB_WRTE) {
+            fprintf(stderr, "RELAY[%u]: msg cmd=0x%08x arg0=%u arg1=%u dlen=%u\n",
+                    r->chan->remote_id, msg.command, msg.arg0, msg.arg1, msg.data_length);
+            fflush(stderr);
+        }
+        if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
+            cnt++;
+            if (cnt <= 5 || cnt % 300 == 0) {
+                fprintf(stderr, "RELAY[%u]: #%d, %u bytes\n", r->chan->remote_id, cnt, msg.data_length);
+                fflush(stderr);
+            }
+            if (msg.data_length > 0) {
+                send(r->local_fd, (const char *)pl, msg.data_length, 0);
+            }
+            /* Send OKAY ack — combine header into single write */
+            {
+                adb_message_t okay;
+                okay.command = ADB_OKAY;
+                okay.arg0 = r->chan->local_id;
+                okay.arg1 = r->chan->remote_id;
+                okay.data_length = 0;
+                okay.data_check = 0;
+                okay.magic = ADB_OKAY ^ 0xFFFFFFFF;
+                int ack = tls_send(r->adb_conn->tls_ctx, &okay, ADB_MSG_HEADER_SIZE);
                 if (cnt <= 5) {
-                    fprintf(stderr, "RELAY: OKAY ack=%d\n", ack);
+                    fprintf(stderr, "RELAY[%u]: OKAY tls_send=%d\n",
+                            r->chan->remote_id, ack);
                     fflush(stderr);
-                }
-            } else if (msg.command == ADB_CLSE) {
-                break;
-            } else if (msg.command == ADB_OKAY) {
-                for (int i = 0; i < r->adb_conn->channel_count; i++) {
-                    if (r->adb_conn->channels[i].local_id == msg.arg1) {
-                        r->adb_conn->channels[i].remote_id = msg.arg0;
-                        r->adb_conn->channels[i].state = CHAN_OPEN;
-                        break;
-                    }
                 }
             }
+        } else if (msg.command == ADB_CLSE) {
+            fprintf(stderr, "RELAY: CLSE received\n");
+            fflush(stderr);
+            break;
+        } else if (msg.command == ADB_OKAY) {
+            for (int i = 0; i < r->adb_conn->channel_count; i++) {
+                if (r->adb_conn->channels[i].local_id == msg.arg1) {
+                    r->adb_conn->channels[i].remote_id = msg.arg0;
+                    r->adb_conn->channels[i].state = CHAN_OPEN;
+                    break;
+                }
+            }
+        } else {
+            fprintf(stderr, "RELAY: unknown cmd=0x%08x\n", msg.command);
+            fflush(stderr);
         }
     }
 
     free(pl);
+    free(recv_buf);
     r->running = 0;
     return 0;
 }
@@ -577,12 +643,14 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
             CLOSESOCKET(listen_fd); return false; \
         } \
         log_info(label " connected (remote_id=%u)", _chan->remote_id); \
+        SET_NONBLOCK(_fwd_conn->fd); \
         out_relay = calloc(1, sizeof(fwd_relay_t)); \
         out_relay->adb_conn = _fwd_conn; \
         out_relay->chan = _chan; \
         out_relay->local_fd = _server; \
         out_relay->running = 1; \
-        CreateThread(NULL, 0, fwd_relay_thread, out_relay, 0, NULL); \
+        { HANDLE _th = CreateThread(NULL, 0, fwd_relay_thread, out_relay, 0, NULL); \
+          if (_th) CloseHandle(_th); } \
         /* Return client side via the macro caller's variable */ \
         _fwd_client_fd = _client; \
     } while(0)
@@ -602,7 +670,6 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
 
     CREATE_FWD("Control", ctrl_relay);
     control_sock->fd = _fwd_client_fd;
-    /* TCP_NODELAY on control socket for low-latency input */
     { int opt = 1; setsockopt(control_sock->fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&opt, sizeof(opt)); }
 
     CLOSESOCKET(listen_fd);

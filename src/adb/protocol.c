@@ -67,40 +67,40 @@ int adb_send_msg(SOCKET_T fd, uint32_t cmd, uint32_t arg0, uint32_t arg1,
 int adb_send_msg_tls(void *tls, SOCKET_T fd, uint32_t cmd, uint32_t arg0, uint32_t arg1,
                      const uint8_t *data, uint32_t data_len, int skip_checksum) {
     (void)fd; /* unused when TLS is provided */
+
+    if (!tls) {
+        return adb_send_msg(fd, cmd, arg0, arg1, data, data_len, skip_checksum);
+    }
+
     adb_message_t msg;
     msg.command = cmd;
     msg.arg0 = arg0;
     msg.arg1 = arg1;
     msg.data_length = data_len;
-    msg.data_check = skip_checksum ? 0 : adb_checksum(data, data_len);
-    msg.magic = cmd ^ 0xffffffff;
+    msg.data_check = (data && !skip_checksum) ? adb_checksum(data, data_len) : 0;
+    msg.magic = cmd ^ 0xFFFFFFFF;
 
-    /* Send header via TLS */
-    uint8_t *buf = (uint8_t *)&msg;
-    size_t total = ADB_MSG_HEADER_SIZE;
-    size_t sent = 0;
+    /* Combine header + data into a single buffer for one SSL_write.
+     * Separate writes cause mbedTLS to split into separate TLS records,
+     * which can cause the receiver to not process the message correctly. */
+    uint32_t total_len = ADB_MSG_HEADER_SIZE + data_len;
+    uint8_t *wbuf = malloc(total_len);
+    if (!wbuf) return -1;
+    memcpy(wbuf, &msg, ADB_MSG_HEADER_SIZE);
+    if (data && data_len > 0) memcpy(wbuf + ADB_MSG_HEADER_SIZE, data, data_len);
 
-    while (sent < total) {
-        int n = tls_send(tls, buf + sent, (int)(total - sent));
-        if (n <= 0) {
-            return -1;
-        }
-        sent += n;
+    uint32_t sent = 0;
+    int retries = 0;
+    while (sent < total_len && retries < 500) {
+        int n = tls_send(tls, wbuf + sent, (int)(total_len - sent));
+        if (n > 0) { sent += n; retries = 0; continue; }
+        if (n < 0) { free(wbuf); return -1; }
+        /* WANT_WRITE — sleep briefly and retry */
+        Sleep(10);
+        retries++;
     }
-
-    /* Send payload if any */
-    if (data_len > 0 && data != NULL) {
-        sent = 0;
-        while (sent < data_len) {
-            int n = tls_send(tls, data + sent, (int)(data_len - sent));
-            if (n <= 0) {
-                return -1;
-            }
-            sent += n;
-        }
-    }
-
-    return 0;
+    free(wbuf);
+    return (sent == total_len) ? 0 : -1;
 }
 
 int adb_recv_msg(SOCKET_T fd, adb_message_t *out_hdr, uint8_t *out_payload,
@@ -216,10 +216,8 @@ int adb_send_msg_conn(adb_connection_t *conn, uint32_t cmd, uint32_t arg0,
                       uint32_t arg1, const uint8_t *data, uint32_t data_len,
                       int skip_checksum) {
     if (conn->tls_ctx) {
-        int ret = adb_send_msg_tls(conn->tls_ctx, conn->fd, cmd, arg0, arg1,
+        return adb_send_msg_tls(conn->tls_ctx, conn->fd, cmd, arg0, arg1,
                                 data, data_len, skip_checksum);
-        if (ret < 0) fprintf(stderr, "DEBUG adb_send_msg_conn: TLS send failed for cmd=0x%08x\n", cmd);
-        return ret;
     }
     return adb_send_msg(conn->fd, cmd, arg0, arg1, data, data_len, skip_checksum);
 }
