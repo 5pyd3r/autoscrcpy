@@ -291,14 +291,16 @@ static void relay_send_okay(fwd_relay_t *r) {
     for (int i = 0; i < 200; i++) {
         int n = tls_send(r->adb_conn->tls_ctx, &okay, ADB_MSG_HEADER_SIZE);
         if (n > 0) return;
-        if (n < 0) return;
+        if (n < 0) { fprintf(stderr, "R:OKAY err\n"); return; }
         SwitchToThread();
     }
     fprintf(stderr, "R:OKAY timeout\n");
 }
 
-/* Relay thread: ADB WRTE → extract payload → send to local socket → OKAY ack.
- * Zero blocking: non-blocking TLS, no Sleep, no logging in hot path. */
+/* Relay thread: bidirectional data relay between ADB channel and local socket.
+ * Device→Local: WRTE from adbd → extract payload → send to local → OKAY ack
+ * Local→Device: recv from local → WRTE to adbd
+ * Non-blocking TLS, no Sleep in hot path. */
 static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
     fwd_relay_t *r = (fwd_relay_t *)arg;
     uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
@@ -306,19 +308,43 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
     rb.buf = malloc(ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
     rb.used = 0; rb.hdr_done = 0; rb.expect = 0;
     if (!pl || !rb.buf) { free(pl); free(rb.buf); return 0; }
-    int rcnt = 0;
+    int rcnt = 0, idle = 0;
+
+    /* Set local socket non-blocking for bidirectional relay */
+    SET_NONBLOCK(r->local_fd);
 
     while (r->running) {
         int ret = relay_try_recv(r->adb_conn->tls_ctx, &rb);
         if (ret < 0) { fprintf(stderr, "R:ERR\n"); break; }
-        if (ret == 0) continue; /* timeout or WANT_READ — retry */
+        if (ret == 0) {
+            idle++;
+            if (idle == 10000 || idle % 100000 == 0)
+                fprintf(stderr, "R:idle %d\n", idle);
+            /* No ADB data — check local socket for client→device data */
+            uint8_t buf[16384];
+            int n = recv(r->local_fd, (char *)buf, sizeof(buf), 0);
+            if (n > 0) {
+                /* Client data → WRTE to adbd */
+                adb_send_msg_tls(r->adb_conn->tls_ctx, r->adb_conn->fd,
+                                 ADB_WRTE, r->chan->local_id, r->chan->remote_id,
+                                 buf, (uint32_t)n, 1);
+            } else if (n == 0) {
+                break; /* client disconnected */
+            }
+            /* n < 0: WOULDBLOCK — no data, continue */
+            SwitchToThread();
+            continue;
+        }
 
+        /* ADB message available */
+        idle = 0;
         adb_message_t msg;
         relay_extract_msg(&rb, &msg, pl, ADB_MAX_PAYLOAD);
 
         if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
             rcnt++;
-            if (rcnt <= 8) fprintf(stderr, "R:%d %uB\n", rcnt, msg.data_length);
+            if (rcnt <= 5 || rcnt % 100 == 0)
+                fprintf(stderr, "R:%d %uB\n", rcnt, msg.data_length);
             if (msg.data_length > 0) {
                 send(r->local_fd, (const char *)pl, msg.data_length, 0);
             }
@@ -545,7 +571,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  "tunnel_forward=true "
                  "send_device_meta=true send_frame_meta=true "
                  "video=%s audio=%s control=%s "
-                 "max_size=%u max_fps=1 video_bit_rate=500000",
+                 "max_size=%u max_fps=10 video_bit_rate=2000000",
                  srv->config.video ? "true" : "false",
                  srv->config.audio ? "true" : "false",
                  srv->config.control ? "true" : "false",
