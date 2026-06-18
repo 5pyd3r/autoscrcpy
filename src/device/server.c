@@ -292,8 +292,9 @@ static void relay_send_okay(fwd_relay_t *r) {
         int n = tls_send(r->adb_conn->tls_ctx, &okay, ADB_MSG_HEADER_SIZE);
         if (n > 0) return;
         if (n < 0) return;
-        SwitchToThread(); /* yield on WANT_WRITE */
+        SwitchToThread();
     }
+    fprintf(stderr, "R:OKAY timeout\n");
 }
 
 /* Relay thread: ADB WRTE → extract payload → send to local socket → OKAY ack.
@@ -305,16 +306,19 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
     rb.buf = malloc(ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
     rb.used = 0; rb.hdr_done = 0; rb.expect = 0;
     if (!pl || !rb.buf) { free(pl); free(rb.buf); return 0; }
+    int rcnt = 0;
 
     while (r->running) {
         int ret = relay_try_recv(r->adb_conn->tls_ctx, &rb);
-        if (ret < 0) break;
-        if (ret == 0) { SwitchToThread(); continue; }
+        if (ret < 0) { fprintf(stderr, "R:ERR\n"); break; }
+        if (ret == 0) continue; /* timeout or WANT_READ — retry */
 
         adb_message_t msg;
         relay_extract_msg(&rb, &msg, pl, ADB_MAX_PAYLOAD);
 
         if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
+            rcnt++;
+            if (rcnt <= 8) fprintf(stderr, "R:%d %uB\n", rcnt, msg.data_length);
             if (msg.data_length > 0) {
                 send(r->local_fd, (const char *)pl, msg.data_length, 0);
             }
