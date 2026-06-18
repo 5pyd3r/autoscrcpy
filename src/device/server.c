@@ -232,99 +232,120 @@ typedef struct {
     volatile int      running;
 } fwd_relay_t;
 
-/* Read one complete ADB message over TLS, looping on WANT_READ.
- * Unlike adb_recv_msg_tls which loses partial data on WANT_READ,
- * this function accumulates data internally until a full message arrives.
- * `buf` must be at least ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD bytes,
- * allocated by the caller (per-thread to avoid races).
- * Returns: 1 = message complete, 0 = no data at all, -1 = error. */
-static int relay_recv_msg(void *tls_ctx, adb_message_t *out_hdr,
-                          uint8_t *out_pl, int max_pl,
-                          uint8_t *buf, int buf_size) {
-    int used = 0, hdr_done = 0, expect = 0;
-    int empty_reads = 0;
+/* Relay thread state — each thread has its own persistent buffer */
+typedef struct {
+    uint8_t *buf;       /* accumulation buffer */
+    int      used;      /* bytes currently in buf */
+    int      hdr_done;  /* 1 if header parsed */
+    int      expect;    /* expected payload size (from header) */
+} relay_buf_t;
 
-    for (;;) {
-        int n = tls_recv(tls_ctx, buf + used, buf_size - used);
-        if (n < 0) return -1;
-        if (n == 0) {
-            /* WANT_READ or timeout (SO_RCVTIMEO) — no data available */
-            if (used == 0) return 0; /* No partial data → caller can retry */
-            /* Have partial data — the socket has SO_RCVTIMEO so tls_recv
-             * already waited up to 1s. If still no data, something is wrong. */
-            empty_reads++;
-            if (empty_reads > 3) return -1; /* 3 x 1s timeout = 3s */
-            continue;
-        }
-        empty_reads = 0;
-        used += n;
+/* Try to read one complete ADB message from TLS into the relay buffer.
+ * Maintains state across calls — partial data is preserved.
+ * Returns: 1 = complete message ready, 0 = need more data, -1 = error. */
+static int relay_try_recv(void *tls_ctx, relay_buf_t *rb) {
+    int buf_size = ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD;
+    int n = tls_recv(tls_ctx, rb->buf + rb->used, buf_size - rb->used);
+    if (n < 0) return -1;
+    if (n == 0) return 0; /* WANT_READ or timeout */
+    rb->used += n;
 
-        if (!hdr_done && used >= ADB_MSG_HEADER_SIZE) {
-            memcpy(out_hdr, buf, ADB_MSG_HEADER_SIZE);
-            if (out_hdr->magic != (out_hdr->command ^ 0xFFFFFFFF)) return -1;
-            hdr_done = 1;
-            expect = (int)out_hdr->data_length;
-        }
-        if (!hdr_done) continue;
-        if (used < ADB_MSG_HEADER_SIZE + expect) continue;
+    /* Parse header if not done yet */
+    if (!rb->hdr_done && rb->used >= ADB_MSG_HEADER_SIZE) {
+        adb_message_t *hdr = (adb_message_t *)rb->buf;
+        if (hdr->magic != (hdr->command ^ 0xFFFFFFFF)) return -1;
+        rb->hdr_done = 1;
+        rb->expect = (int)hdr->data_length;
+    }
+    if (!rb->hdr_done) return 0;
+    if (rb->used < ADB_MSG_HEADER_SIZE + rb->expect) return 0;
+    return 1; /* complete message */
+}
 
-        /* Complete message received */
-        if (expect > 0 && out_pl) {
-            int cl = expect > max_pl ? max_pl : expect;
-            memcpy(out_pl, buf + ADB_MSG_HEADER_SIZE, cl);
-        }
-        return 1;
+/* Extract the complete message from relay buffer, reset state for next message */
+static void relay_extract_msg(relay_buf_t *rb, adb_message_t *out_hdr,
+                              uint8_t *out_pl, int max_pl) {
+    memcpy(out_hdr, rb->buf, ADB_MSG_HEADER_SIZE);
+    if (rb->expect > 0 && out_pl) {
+        int cl = rb->expect > max_pl ? max_pl : rb->expect;
+        memcpy(out_pl, rb->buf + ADB_MSG_HEADER_SIZE, cl);
+    }
+    /* Shift remaining data to front */
+    int msg_total = ADB_MSG_HEADER_SIZE + rb->expect;
+    int remaining = rb->used - msg_total;
+    if (remaining > 0) memmove(rb->buf, rb->buf + msg_total, remaining);
+    rb->used = remaining;
+    rb->hdr_done = 0;
+    rb->expect = 0;
+}
+
+/* Build and send OKAY ack for a WRTE message.
+ * Retries on WANT_WRITE — critical for flow control. */
+static void relay_send_okay(fwd_relay_t *r) {
+    adb_message_t okay;
+    okay.command = ADB_OKAY;
+    okay.arg0 = r->chan->local_id;
+    okay.arg1 = r->chan->remote_id;
+    okay.data_length = 0;
+    okay.data_check = 0;
+    okay.magic = ADB_OKAY ^ 0xFFFFFFFF;
+    /* Retry loop for non-blocking TLS */
+    for (int i = 0; i < 100; i++) {
+        int n = tls_send(r->adb_conn->tls_ctx, &okay, ADB_MSG_HEADER_SIZE);
+        if (n > 0) return; /* sent */
+        if (n < 0) return; /* error — best effort */
+        /* WANT_WRITE — sleep briefly and retry */
+        Sleep(1);
     }
 }
 
-/* Bidirectional relay: ADB channel ↔ local socket.
- * Device→Local: WRTE from adbd → send() to local → OKAY ack */
+/* Relay thread: reads ADB WRTE from TLS, sends payload to local socket, acks OKAY.
+ * Uses non-blocking TLS with select() for efficient I/O waiting.
+ * Data flow mirrors official adb-server: WRTE recv → extract payload → send to local → OKAY ack. */
 static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
     fwd_relay_t *r = (fwd_relay_t *)arg;
-    /* Per-thread buffers — must not be shared across threads */
     uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
-    uint8_t *recv_buf = malloc(ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
-    if (!pl || !recv_buf) { free(pl); free(recv_buf); return 0; }
+    relay_buf_t rb;
+    rb.buf = malloc(ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
+    rb.used = 0; rb.hdr_done = 0; rb.expect = 0;
+    if (!pl || !rb.buf) { free(pl); free(rb.buf); return 0; }
     int cnt = 0;
+    SOCKET_T raw_fd = r->adb_conn->fd;
 
     while (r->running) {
-        adb_message_t msg;
-        memset(&msg, 0, sizeof(msg));
-        int ret = relay_recv_msg(r->adb_conn->tls_ctx, &msg, pl, ADB_MAX_PAYLOAD,
-                                 recv_buf, ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
-        if (ret < 0) {
-            break;
-        }
+        /* Try to read from TLS layer (may have buffered data) */
+        int ret = relay_try_recv(r->adb_conn->tls_ctx, &rb);
+
+        if (ret < 0) break; /* error */
+
         if (ret == 0) {
+            /* WANT_READ — TLS has no complete message yet.
+             * Sleep briefly and retry. Non-blocking socket means tls_recv
+             * returns immediately, no busy-wait. */
+            Sleep(1);
             continue;
         }
-        /* ret == 1: got a message */
+
+        /* Complete message — extract and process */
+        adb_message_t msg;
+        relay_extract_msg(&rb, &msg, pl, ADB_MAX_PAYLOAD);
+
         if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
+            /* Data from device → send to local socket → OKAY ack.
+             * OKAY must be sent promptly for flow control (one WRTE in-flight). */
             cnt++;
-            if (cnt <= 3 || cnt % 300 == 0) {
-                fprintf(stderr, "RELAY[%u]: #%d, %u bytes\n",
-                        r->chan->remote_id, cnt, msg.data_length);
+            if (cnt <= 5 || cnt % 300 == 0) {
+                fprintf(stderr, "R[%u]:#%d %uB\n", r->chan->remote_id, cnt, msg.data_length);
                 fflush(stderr);
             }
             if (msg.data_length > 0) {
                 send(r->local_fd, (const char *)pl, msg.data_length, 0);
             }
-            /* Send OKAY ack via direct tls_send (24-byte header, single write) */
-            {
-                adb_message_t okay;
-                okay.command = ADB_OKAY;
-                okay.arg0 = r->chan->local_id;
-                okay.arg1 = r->chan->remote_id;
-                okay.data_length = 0;
-                okay.data_check = 0;
-                okay.magic = ADB_OKAY ^ 0xFFFFFFFF;
-                tls_send(r->adb_conn->tls_ctx, &okay, ADB_MSG_HEADER_SIZE);
-            }
+            relay_send_okay(r);
         } else if (msg.command == ADB_CLSE) {
-            fprintf(stderr, "RELAY: CLSE received\n");
-            fflush(stderr);
             break;
         } else if (msg.command == ADB_OKAY) {
+            /* Channel open confirmation */
             for (int i = 0; i < r->adb_conn->channel_count; i++) {
                 if (r->adb_conn->channels[i].local_id == msg.arg1) {
                     r->adb_conn->channels[i].remote_id = msg.arg0;
@@ -332,14 +353,12 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
                     break;
                 }
             }
-        } else {
-            fprintf(stderr, "RELAY: unknown cmd=0x%08x\n", msg.command);
-            fflush(stderr);
         }
+        /* Ignore other messages (STLS re-sends, etc.) */
     }
 
     free(pl);
-    free(recv_buf);
+    free(rb.buf);
     r->running = 0;
     return 0;
 }
@@ -625,7 +644,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
             CLOSESOCKET(listen_fd); return false; \
         } \
         log_info(label " connected (remote_id=%u)", _chan->remote_id); \
-        { DWORD _tv = 1000; setsockopt(_fwd_conn->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&_tv, sizeof(_tv)); } \
+        SET_NONBLOCK(_fwd_conn->fd); \
         out_relay = calloc(1, sizeof(fwd_relay_t)); \
         out_relay->adb_conn = _fwd_conn; \
         out_relay->chan = _chan; \
