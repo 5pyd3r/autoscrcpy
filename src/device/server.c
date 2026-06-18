@@ -502,7 +502,10 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  "app_process / com.genymobile.scrcpy.Server 3.3.2 "
                  "tunnel_forward=true "
                  "send_device_meta=true send_frame_meta=true "
-                 "audio=false control=true");
+                 "video=%s audio=%s control=%s",
+                 srv->config.video ? "true" : "false",
+                 srv->config.audio ? "true" : "false",
+                 srv->config.control ? "true" : "false");
         log_info("Starting scrcpy-server...");
         if (!adb_shell(conn, cmd)) { log_error("Shell failed"); return false; }
 
@@ -588,43 +591,67 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         _fwd_client_fd = _client; \
     } while(0)
 
-    /* Connect video stream */
+    /* Connect ALL streams first — scrcpy-server waits for all connections
+     * before sending any data. Order: video, audio, control. */
     SOCKET_T _fwd_client_fd = INVALID_SOCKFD;
-    fwd_relay_t *video_relay = NULL;
+    fwd_relay_t *video_relay = NULL, *audio_relay = NULL, *ctrl_relay = NULL;
+
     CREATE_FWD("Video", video_relay);
     video_sock->fd = _fwd_client_fd;
 
-    /* Read video metadata from the raw TCP socket (forwarded by relay) */
+    if (srv->config.audio) {
+        CREATE_FWD("Audio", audio_relay);
+        audio_sock->fd = _fwd_client_fd;
+    }
+
+    CREATE_FWD("Control", ctrl_relay);
+    control_sock->fd = _fwd_client_fd;
+    /* TCP_NODELAY on control socket for low-latency input */
+    { int opt = 1; setsockopt(control_sock->fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&opt, sizeof(opt)); }
+
+    CLOSESOCKET(listen_fd);
+    log_info("All sockets connected, reading metadata...");
+
+    /* Now read video metadata — server starts sending after all sockets connect.
+     * Protocol: 1-byte dummy (forward mode liveness check, discarded) + 64-byte device name */
+    uint8_t dummy;
+    recv_exact(video_sock->fd, &dummy, 1); /* discard liveness byte */
+
     uint8_t devname[65] = {0};
     if (recv_exact(video_sock->fd, devname, 64) < 0) {
         log_error("Failed to read device name");
-        CLOSESOCKET(listen_fd); return false;
+        return false;
     }
     log_info("Device: %s", devname);
 
-    uint8_t shdr[12];
-    if (recv_exact(video_sock->fd, shdr, 12) < 0) {
-        log_error("Failed to read stream header");
-        CLOSESOCKET(listen_fd); return false;
+    /* Read codec ID (4 bytes, big-endian) */
+    uint8_t codec_buf[4];
+    if (recv_exact(video_sock->fd, codec_buf, 4) < 0) {
+        log_error("Failed to read codec ID");
+        return false;
     }
-    video_sock->codec_id = ((uint32_t)shdr[0]<<24)|((uint32_t)shdr[1]<<16)|
-                            ((uint32_t)shdr[2]<<8)|(uint32_t)shdr[3];
-    video_sock->width = ((uint32_t)shdr[4]<<24)|((uint32_t)shdr[5]<<16)|
-                         ((uint32_t)shdr[6]<<8)|(uint32_t)shdr[7];
-    video_sock->height = ((uint32_t)shdr[8]<<24)|((uint32_t)shdr[9]<<16)|
-                          ((uint32_t)shdr[10]<<8)|(uint32_t)shdr[11];
+    video_sock->codec_id = ((uint32_t)codec_buf[0]<<24)|((uint32_t)codec_buf[1]<<16)|
+                            ((uint32_t)codec_buf[2]<<8)|(uint32_t)codec_buf[3];
+
+    /* Read stream metadata: width(4BE) + height(4BE).
+     * scrcpy-server 3.3.2 sends codec(4)+width(4)+height(4) = 12 bytes total.
+     * No separate session header marker. */
+    uint8_t meta[8];
+    if (recv_exact(video_sock->fd, meta, 8) < 0) {
+        log_error("Failed to read stream metadata");
+        return false;
+    }
+    video_sock->width = ((uint32_t)meta[0]<<24)|((uint32_t)meta[1]<<16)|
+                         ((uint32_t)meta[2]<<8)|(uint32_t)meta[3];
+    video_sock->height = ((uint32_t)meta[4]<<24)|((uint32_t)meta[5]<<16)|
+                          ((uint32_t)meta[6]<<8)|(uint32_t)meta[7];
+
     const char *cn = "unknown";
     if (video_sock->codec_id == 0x68323634) cn = "H.264";
     else if (video_sock->codec_id == 0x68323635) cn = "H.265";
     else if (video_sock->codec_id == 0x00617631) cn = "AV1";
     log_info("Video: %s, %ux%u", cn, video_sock->width, video_sock->height);
 
-    /* Connect control stream */
-    fwd_relay_t *ctrl_relay = NULL;
-    CREATE_FWD("Control", ctrl_relay);
-    control_sock->fd = _fwd_client_fd;
-
-    CLOSESOCKET(listen_fd);
     srv->running = true;
     log_info("Server started successfully");
     return true;
