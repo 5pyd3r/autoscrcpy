@@ -646,6 +646,10 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     else if (video_sock->codec_id == 0x00617631) cn = "AV1";
     log_info("Video: %s, %ux%u", cn, video_sock->width, video_sock->height);
 
+    fprintf(stderr, "FDS: video_fd=%d relay_local_fd=%d\n",
+            (int)video_sock->fd, (int)(video_relay ? video_relay->local_fd : -1));
+    fflush(stderr);
+
     srv->running = true;
     log_info("Server started successfully");
     return true;
