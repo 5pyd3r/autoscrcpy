@@ -38,18 +38,6 @@ bool video_socket_accept(video_socket_t *sock, SOCKET_T listen_fd) {
 }
 
 bool video_socket_read_packet(video_socket_t *sock, uint8_t **data, uint32_t *size) {
-    /* Peek first 16 bytes to see what's in the socket */
-    static int peek_count = 0;
-    if (peek_count < 3) {
-        uint8_t peek[16];
-        int pn = recv(sock->fd, (char *)peek, 16, MSG_PEEK);
-        fprintf(stderr, "VSOCK_PEEK[%d/%d]: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                peek_count, pn, peek[0], peek[1], peek[2], peek[3], peek[4], peek[5], peek[6], peek[7],
-                peek[8], peek[9], peek[10], peek[11], peek[12], peek[13], peek[14], peek[15]);
-        fflush(stderr);
-        peek_count++;
-    }
-
     /* Read 12-byte packet header (big-endian):
      * bytes 0-7: PTS + flags (uint64 BE)
      *   bit 63: 0 (media packet marker)
@@ -95,15 +83,6 @@ bool video_socket_read_packet(video_socket_t *sock, uint8_t **data, uint32_t *si
 
     /* Media packet: parse PTS and size (big-endian) */
     uint32_t packet_size = read32be(header + 8);
-
-    static int dbg_pkt = 0;
-    if (dbg_pkt < 5) {
-        fprintf(stderr, "VSOCK: pkt%d hdr=[%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x] size=%u\n",
-                dbg_pkt, header[0], header[1], header[2], header[3], header[4], header[5],
-                header[6], header[7], header[8], header[9], header[10], header[11], packet_size);
-        fflush(stderr);
-    }
-    dbg_pkt++;
 
     if (packet_size == 0) {
         *data = NULL;

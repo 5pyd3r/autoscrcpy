@@ -248,10 +248,12 @@ static int relay_recv_msg(void *tls_ctx, adb_message_t *out_hdr,
         int n = tls_recv(tls_ctx, buf + used, buf_size - used);
         if (n < 0) return -1;
         if (n == 0) {
-            /* WANT_READ or timeout — no data available right now */
-            if (used == 0) return 0; /* No partial data → caller can retry later */
+            /* WANT_READ or timeout (SO_RCVTIMEO) — no data available */
+            if (used == 0) return 0; /* No partial data → caller can retry */
+            /* Have partial data — the socket has SO_RCVTIMEO so tls_recv
+             * already waited up to 1s. If still no data, something is wrong. */
             empty_reads++;
-            if (empty_reads > 20) return -1; /* Stuck too long with partial data */
+            if (empty_reads > 3) return -1; /* 3 x 1s timeout = 3s */
             continue;
         }
         empty_reads = 0;
@@ -284,7 +286,6 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
     uint8_t *recv_buf = malloc(ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
     if (!pl || !recv_buf) { free(pl); free(recv_buf); return 0; }
     int cnt = 0;
-    int idle = 0;
 
     while (r->running) {
         adb_message_t msg;
@@ -292,37 +293,23 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
         int ret = relay_recv_msg(r->adb_conn->tls_ctx, &msg, pl, ADB_MAX_PAYLOAD,
                                  recv_buf, ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
         if (ret < 0) {
-            fprintf(stderr, "RELAY[%u]: recv error after %d msgs, idle=%d\n",
-                    r->chan->remote_id, cnt, idle);
-            fflush(stderr);
             break;
         }
         if (ret == 0) {
-            idle++;
-            if (idle == 1 || idle % 1000 == 0) {
-                fprintf(stderr, "RELAY[%u]: idle=%d (no data)\n", r->chan->remote_id, idle);
-                fflush(stderr);
-            }
-            Sleep(1);
             continue;
         }
-        idle = 0;
         /* ret == 1: got a message */
-        if (cnt < 10 || msg.command != ADB_WRTE) {
-            fprintf(stderr, "RELAY[%u]: msg cmd=0x%08x arg0=%u arg1=%u dlen=%u\n",
-                    r->chan->remote_id, msg.command, msg.arg0, msg.arg1, msg.data_length);
-            fflush(stderr);
-        }
         if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
             cnt++;
-            if (cnt <= 5 || cnt % 300 == 0) {
-                fprintf(stderr, "RELAY[%u]: #%d, %u bytes\n", r->chan->remote_id, cnt, msg.data_length);
+            if (cnt <= 3 || cnt % 300 == 0) {
+                fprintf(stderr, "RELAY[%u]: #%d, %u bytes\n",
+                        r->chan->remote_id, cnt, msg.data_length);
                 fflush(stderr);
             }
             if (msg.data_length > 0) {
                 send(r->local_fd, (const char *)pl, msg.data_length, 0);
             }
-            /* Send OKAY ack — combine header into single write */
+            /* Send OKAY ack via direct tls_send (24-byte header, single write) */
             {
                 adb_message_t okay;
                 okay.command = ADB_OKAY;
@@ -331,12 +318,7 @@ static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
                 okay.data_length = 0;
                 okay.data_check = 0;
                 okay.magic = ADB_OKAY ^ 0xFFFFFFFF;
-                int ack = tls_send(r->adb_conn->tls_ctx, &okay, ADB_MSG_HEADER_SIZE);
-                if (cnt <= 5) {
-                    fprintf(stderr, "RELAY[%u]: OKAY tls_send=%d\n",
-                            r->chan->remote_id, ack);
-                    fflush(stderr);
-                }
+                tls_send(r->adb_conn->tls_ctx, &okay, ADB_MSG_HEADER_SIZE);
             }
         } else if (msg.command == ADB_CLSE) {
             fprintf(stderr, "RELAY: CLSE received\n");
@@ -643,7 +625,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
             CLOSESOCKET(listen_fd); return false; \
         } \
         log_info(label " connected (remote_id=%u)", _chan->remote_id); \
-        SET_NONBLOCK(_fwd_conn->fd); \
+        { DWORD _tv = 1000; setsockopt(_fwd_conn->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&_tv, sizeof(_tv)); } \
         out_relay = calloc(1, sizeof(fwd_relay_t)); \
         out_relay->adb_conn = _fwd_conn; \
         out_relay->chan = _chan; \
@@ -712,10 +694,6 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     else if (video_sock->codec_id == 0x68323635) cn = "H.265";
     else if (video_sock->codec_id == 0x00617631) cn = "AV1";
     log_info("Video: %s, %ux%u", cn, video_sock->width, video_sock->height);
-
-    fprintf(stderr, "FDS: video_fd=%d relay_local_fd=%d\n",
-            (int)video_sock->fd, (int)(video_relay ? video_relay->local_fd : -1));
-    fflush(stderr);
 
     srv->running = true;
     log_info("Server started successfully");
