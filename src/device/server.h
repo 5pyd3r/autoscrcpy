@@ -28,6 +28,9 @@ typedef struct server {
     void *adb_conn;          /* adb_connection_t* */
     void *video_chan;        /* adb_channel_t* for video stream */
     SOCKET_T video_read_fd;  /* read end of video socketpair */
+    SOCKET_T video_write_fd; /* write end of video socketpair (owned by reader thread) */
+    HANDLE reader_thread;    /* ADB reader thread handle */
+    volatile int *reader_running; /* pointer to reader's running flag */
     volatile bool running;
 } server_t;
 

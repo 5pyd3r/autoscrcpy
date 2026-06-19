@@ -10,7 +10,7 @@ static const struct {
     {VK_LMENU, 57}, {VK_RMENU, 58}, {VK_CAPITAL, 115}, {VK_ESCAPE, 111},
     {VK_SPACE, 62}, {VK_PRIOR, 92}, {VK_NEXT, 93}, {VK_END, 123}, {VK_HOME, 122},
     {VK_LEFT, 21}, {VK_UP, 19}, {VK_RIGHT, 22}, {VK_DOWN, 20},
-    {VK_INSERT, 124}, {VK_DELETE, 67},
+    {VK_INSERT, 124}, {VK_DELETE, 112},
     {'0', 7}, {'1', 8}, {'2', 9}, {'3', 10}, {'4', 11},
     {'5', 12}, {'6', 13}, {'7', 14}, {'8', 15}, {'9', 16},
     {'A', 29}, {'B', 30}, {'C', 31}, {'D', 32}, {'E', 33}, {'F', 34},

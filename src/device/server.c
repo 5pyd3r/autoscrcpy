@@ -15,6 +15,11 @@ bool server_init(server_t *srv, const struct server_config *config) {
     srv->config = *config;
     srv->listen_fd = INVALID_SOCKFD;
     srv->adb_conn = NULL;
+    srv->video_chan = NULL;
+    srv->video_read_fd = INVALID_SOCKFD;
+    srv->video_write_fd = INVALID_SOCKFD;
+    srv->reader_thread = NULL;
+    srv->reader_running = NULL;
     srv->running = false;
     return true;
 }
@@ -197,6 +202,7 @@ static adb_connection_t *do_adb_connect(const char *host, uint16_t port) {
     }
 
 fail:
+    if (conn->tls_ctx) { tls_free(conn->tls_ctx); conn->tls_ctx = NULL; }
     CLOSESOCKET(fd);
     free(conn);
     return NULL;
@@ -748,8 +754,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     reader.video_chan = video_chan;
     reader.video_write_fd = sp[1];
     reader.running = 1;
-    HANDLE reader_th = CreateThread(NULL, 0, adb_reader_thread, &reader, 0, NULL);
-    if (reader_th) CloseHandle(reader_th);
+    srv->reader_thread = CreateThread(NULL, 0, adb_reader_thread, &reader, 0, NULL);
     log_info("ADB reader thread started");
 
     /* Wait for video channel to open (reader thread processes OKAY) */
@@ -850,6 +855,8 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     srv->adb_conn = conn;
     srv->video_chan = video_chan;
     srv->video_read_fd = sp[0];
+    srv->video_write_fd = sp[1];
+    srv->reader_running = &reader.running;
 
     srv->running = true;
     log_info("Server started successfully");
@@ -865,6 +872,20 @@ void server_kill(server_t *srv) {
 }
 
 void server_destroy(server_t *srv) {
+    /* Stop reader thread first */
+    if (srv->reader_running) {
+        *srv->reader_running = 0;
+    }
+    if (srv->reader_thread) {
+        WaitForSingleObject(srv->reader_thread, 3000);
+        CloseHandle(srv->reader_thread);
+        srv->reader_thread = NULL;
+    }
+    /* Close write-end socket (reader thread's socket) */
+    if (srv->video_write_fd != INVALID_SOCKFD) {
+        CLOSESOCKET(srv->video_write_fd);
+        srv->video_write_fd = INVALID_SOCKFD;
+    }
     if (srv->adb_conn) {
         adb_disconnect((adb_connection_t *)srv->adb_conn);
         srv->adb_conn = NULL;

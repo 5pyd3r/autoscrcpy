@@ -52,7 +52,7 @@ int muxer_add_video_stream(muxer_t *mux, uint32_t codec_id, uint32_t width, uint
         case 0x68323635: // h265
             stream->codecpar->codec_id = AV_CODEC_ID_HEVC;
             break;
-        case 0x00415631: // av01
+        case 0x00617631: // av1
             stream->codecpar->codec_id = AV_CODEC_ID_AV1;
             break;
         default:

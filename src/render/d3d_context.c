@@ -51,6 +51,7 @@ bool d3d_context_init(d3d_context_t *ctx, HWND hwnd, int width, int height) {
     hr = ctx->swap_chain->lpVtbl->GetBuffer(ctx->swap_chain, 0, &IID_ID3D11Texture2D, (void **)&back_buffer);
     if (FAILED(hr)) {
         log_error("Failed to get back buffer: 0x%08x", hr);
+        d3d_context_destroy(ctx);
         return false;
     }
 
@@ -59,6 +60,7 @@ bool d3d_context_init(d3d_context_t *ctx, HWND hwnd, int width, int height) {
 
     if (FAILED(hr)) {
         log_error("Failed to create render target view: 0x%08x", hr);
+        d3d_context_destroy(ctx);
         return false;
     }
 
@@ -78,7 +80,7 @@ void d3d_context_resize(d3d_context_t *ctx, int width, int height) {
     ctx->height = height;
 
     ctx->device_ctx->lpVtbl->OMSetRenderTargets(ctx->device_ctx, 0, NULL, NULL);
-    ctx->rtv->lpVtbl->Release(ctx->rtv);
+    if (ctx->rtv) { ctx->rtv->lpVtbl->Release(ctx->rtv); ctx->rtv = NULL; }
 
     HRESULT hr = ctx->swap_chain->lpVtbl->ResizeBuffers(ctx->swap_chain, 0, width, height, DXGI_FORMAT_UNKNOWN, 0);
     if (FAILED(hr)) {
@@ -103,11 +105,13 @@ void d3d_context_resize(d3d_context_t *ctx, int width, int height) {
 
     ctx->device_ctx->lpVtbl->OMSetRenderTargets(ctx->device_ctx, 1, &ctx->rtv, NULL);
 
-    D3D11_VIEWPORT vp = {0, 0, width, height, 0, 1};
+    D3D11_VIEWPORT vp = {0, 0, (FLOAT)width, (FLOAT)height, 0, 1};
     ctx->device_ctx->lpVtbl->RSSetViewports(ctx->device_ctx, 1, &vp);
 }
 
 void d3d_context_begin_frame(d3d_context_t *ctx) {
+    if (!ctx->rtv) return; /* Resize in progress or failed */
+
     /* Rebind render target and viewport every frame (may have changed after resize) */
     ctx->device_ctx->lpVtbl->OMSetRenderTargets(ctx->device_ctx, 1, &ctx->rtv, NULL);
 

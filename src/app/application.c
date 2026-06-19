@@ -74,6 +74,8 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
     memset(&app->audio_sock, 0, sizeof(app->audio_sock));
     memset(&app->control_sock, 0, sizeof(app->control_sock));
     memset(&app->shared_frame, 0, sizeof(app->shared_frame));
+    memset(&app->d3d_ctx, 0, sizeof(app->d3d_ctx));
+    memset(&app->renderer, 0, sizeof(app->renderer));
 
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
@@ -101,14 +103,18 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
         log_error("D3D init failed"); return false;
     }
     if (!video_renderer_init(&app->renderer, &app->d3d_ctx)) {
-        log_error("Renderer init failed"); return false;
+        log_error("Renderer init failed");
+        d3d_context_destroy(&app->d3d_ctx);
+        return false;
     }
 
     app->video_decoder = video_decoder_create();
     app->audio_decoder = audio_decoder_create();
     app->audio_player = audio_player_create();
     if (!app->video_decoder || !app->audio_decoder || !app->audio_player) {
-        log_error("Decoder/player alloc failed"); return false;
+        log_error("Decoder/player alloc failed");
+        application_destroy(app);
+        return false;
     }
     audio_player_init(app->audio_player, 48000, 2);
 
@@ -145,6 +151,8 @@ int application_run(application_t *app) {
         if (!video_decoder_init(app->video_decoder, app->video_sock.codec_id,
                                 app->video_sock.width, app->video_sock.height)) {
             log_error("Video decoder init failed");
+            server_kill(&app->server);
+            server_destroy(&app->server);
             return 1;
         }
         log_info("Video: %ux%u", app->video_sock.width, app->video_sock.height);
@@ -172,11 +180,12 @@ int application_run(application_t *app) {
             /* Idle: render latest decoded frame */
             if (app->shared_frame.ready) {
                 shared_frame_t *sf = &app->shared_frame;
-                video_frame_t frame = {
-                    .data = sf->data, .width = sf->width,
-                    .height = sf->height, .format = 0
-                };
-                sf->data = NULL;
+                /* Atomically take ownership of the frame data */
+                video_frame_t frame = {0};
+                frame.data = InterlockedExchangePointer(
+                    (volatile PVOID *)&sf->data, NULL);
+                frame.width = sf->width;
+                frame.height = sf->height;
                 InterlockedExchange(&sf->ready, 0);
 
                 render_count++;

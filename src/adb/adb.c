@@ -85,6 +85,9 @@ adb_connection_t *adb_connect(const char *host, uint16_t port) {
     fflush(stderr);
 
     /* Read device response — use direct select+recv (session_poll has issues) */
+    uint8_t *payload = malloc(ADB_MAX_PAYLOAD);
+    if (!payload) { log_error("Failed to allocate payload buffer"); goto handshake_fail; }
+
     for (int tries = 0; tries < 100 && conn->state != ADB_STATE_CONNECTED; tries++) {
         fd_set read_fds;
         FD_ZERO(&read_fds);
@@ -112,7 +115,6 @@ adb_connection_t *adb_connect(const char *host, uint16_t port) {
         if (magic != (cmd ^ 0xffffffff)) goto handshake_fail;
 
         /* Read payload */
-        uint8_t payload[ADB_MAX_PAYLOAD];
         if (dlen > 0 && dlen <= ADB_MAX_PAYLOAD) {
             received = 0;
             while (received < (int)dlen) {
@@ -169,7 +171,7 @@ adb_connection_t *adb_connect(const char *host, uint16_t port) {
         }
     }
 
-handshake_fail:
+    free(payload);
 
     if (conn->state != ADB_STATE_CONNECTED) {
         log_error("ADB handshake failed, state=%d", conn->state);
@@ -179,6 +181,12 @@ handshake_fail:
 
     log_info("ADB connected to %s:%u", host, port);
     return conn;
+
+handshake_fail:
+    free(payload);
+    log_error("ADB handshake failed, state=%d", conn->state);
+    adb_disconnect(conn);
+    return NULL;
 }
 
 void adb_disconnect(adb_connection_t *conn) {
@@ -220,6 +228,9 @@ static bool adb_sync_send(adb_connection_t *conn, adb_channel_t *chan,
     fflush(stderr);
     log_info("Waiting for sync channel to open... (chan->state=%d, local_id=%u, remote_id=%u)",
              chan->state, chan->local_id, chan->remote_id);
+    uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
+    if (!pl) { log_error("Failed to allocate sync buffer"); return false; }
+
     int retries = 200;
     while (chan->state == CHAN_OPENING && retries > 0) {
         /* Inline: select + recv_msg + handle */
@@ -232,9 +243,8 @@ static bool adb_sync_send(adb_connection_t *conn, adb_channel_t *chan,
         fflush(stderr);
         if (sel > 0) {
             adb_message_t msg;
-            uint8_t pl[ADB_MAX_PAYLOAD];
             int skip = conn->protocol_version >= ADB_VERSION_SKIP_CHECKSUM;
-            int n = adb_recv_msg_conn(conn, &msg, pl, sizeof(pl), skip);
+            int n = adb_recv_msg_conn(conn, &msg, pl, ADB_MAX_PAYLOAD, skip);
             fprintf(stderr, "DEBUG adb_sync_send: recv=%d cmd=0x%08x\n", n, msg.command);
             fflush(stderr);
             if (n == 1) {
@@ -245,6 +255,7 @@ static bool adb_sync_send(adb_connection_t *conn, adb_channel_t *chan,
     }
     if (chan->state != CHAN_OPEN) {
         log_error("Sync channel did not open (state=%d)", chan->state);
+        free(pl);
         return false;
     }
     log_info("Sync channel opened, sending SEND command...");
@@ -288,6 +299,7 @@ static bool adb_sync_send(adb_connection_t *conn, adb_channel_t *chan,
         retries--;
     }
 
+    free(pl);
     return true;
 }
 

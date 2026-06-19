@@ -35,12 +35,15 @@ bool video_renderer_init(video_renderer_t *renderer, d3d_context_t *ctx) {
     renderer->window_width = (uint32_t)ctx->width;
     renderer->window_height = (uint32_t)ctx->height;
     renderer->initialized = false;
+    renderer->vb = NULL;
+    renderer->ib = NULL;
     renderer->cb = NULL;
     renderer->sampler = NULL;
     renderer->nv12_tex = NULL;
     renderer->nv12_staging = NULL;
     renderer->y_srv = NULL;
     renderer->uv_srv = NULL;
+    memset(&renderer->shader, 0, sizeof(renderer->shader));
 
     /* Create vertex buffer */
     D3D11_BUFFER_DESC vb_desc = {0};
@@ -69,6 +72,7 @@ bool video_renderer_init(video_renderer_t *renderer, d3d_context_t *ctx) {
     hr = ctx->device->lpVtbl->CreateBuffer(ctx->device, &ib_desc, &ib_data, &renderer->ib);
     if (FAILED(hr)) {
         log_error("Failed to create index buffer: 0x%08x", hr);
+        video_renderer_destroy(renderer);
         return false;
     }
 
@@ -85,6 +89,7 @@ bool video_renderer_init(video_renderer_t *renderer, d3d_context_t *ctx) {
     hr = ctx->device->lpVtbl->CreateBuffer(ctx->device, &cb_desc, &cb_data, &renderer->cb);
     if (FAILED(hr)) {
         log_error("Failed to create constant buffer: 0x%08x", hr);
+        video_renderer_destroy(renderer);
         return false;
     }
 
@@ -101,6 +106,7 @@ bool video_renderer_init(video_renderer_t *renderer, d3d_context_t *ctx) {
     hr = ctx->device->lpVtbl->CreateSamplerState(ctx->device, &samp_desc, &renderer->sampler);
     if (FAILED(hr)) {
         log_error("Failed to create sampler state: 0x%08x", hr);
+        video_renderer_destroy(renderer);
         return false;
     }
 
@@ -110,10 +116,12 @@ bool video_renderer_init(video_renderer_t *renderer, d3d_context_t *ctx) {
                                         vs_bytecode, vs_bytecode_size,
                                         ps_nv12_bytecode, ps_nv12_bytecode_size)) {
             log_error("Failed to load shaders from bytecode");
+            video_renderer_destroy(renderer);
             return false;
         }
     } else {
         log_warn("Shader bytecode not available");
+        video_renderer_destroy(renderer);
         return false;
     }
 

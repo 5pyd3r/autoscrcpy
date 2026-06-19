@@ -29,7 +29,7 @@ bool video_decoder_init(video_decoder_t *decoder, uint32_t codec_id,
     switch (codec_id) {
         case 0x68323634: codec = avcodec_find_decoder(AV_CODEC_ID_H264); break;
         case 0x68323635: codec = avcodec_find_decoder(AV_CODEC_ID_HEVC); break;
-        case 0x00415631: codec = avcodec_find_decoder(AV_CODEC_ID_AV1); break;
+        case 0x00617631: codec = avcodec_find_decoder(AV_CODEC_ID_AV1); break;
         default:
             log_error("Unsupported video codec: 0x%08x", codec_id);
             return false;
@@ -47,7 +47,9 @@ bool video_decoder_init(video_decoder_t *decoder, uint32_t codec_id,
     decoder->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
     if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
-        log_error("Failed to open codec"); return false;
+        log_error("Failed to open codec");
+        avcodec_free_context(&decoder->codec_ctx);
+        return false;
     }
     return true;
 }

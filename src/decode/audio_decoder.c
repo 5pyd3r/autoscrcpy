@@ -56,11 +56,12 @@ bool audio_decoder_init(audio_decoder_t *decoder, uint32_t codec_id,
     }
 
     decoder->codec_ctx->sample_rate = sample_rate;
-    decoder->codec_ctx->ch_layout.nb_channels = channels;
+    av_channel_layout_default(&decoder->codec_ctx->ch_layout, channels);
     decoder->codec_ctx->sample_fmt = AV_SAMPLE_FMT_FLT;
 
     if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
         log_error("Failed to open codec");
+        avcodec_free_context(&decoder->codec_ctx);
         return false;
     }
 

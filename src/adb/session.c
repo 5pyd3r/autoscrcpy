@@ -324,15 +324,17 @@ int session_poll(adb_connection_t *conn, int timeout_ms) {
 
     /* Use adb_recv_msg_conn which handles TLS transparently */
     adb_message_t hdr;
-    uint8_t payload[ADB_MAX_PAYLOAD];
+    uint8_t *payload = malloc(ADB_MAX_PAYLOAD);
+    if (!payload) return -1;
     int skip = conn->protocol_version >= ADB_VERSION_SKIP_CHECKSUM;
-    int n = adb_recv_msg_conn(conn, &hdr, payload, sizeof(payload), skip);
+    int n = adb_recv_msg_conn(conn, &hdr, payload, ADB_MAX_PAYLOAD, skip);
     fprintf(stderr, "DEBUG session_poll: adb_recv_msg_conn returned %d\n", n);
     fflush(stderr);
-    if (n < 0) return -1;
+    if (n < 0) { free(payload); return -1; }
 
     fprintf(stderr, "DEBUG session_poll: cmd=0x%08x arg0=%u arg1=%u dlen=%u\n", hdr.command, hdr.arg0, hdr.arg1, hdr.data_length);
     fflush(stderr);
     session_handle_message(conn, &hdr, payload);
+    free(payload);
     return 1;
 }
