@@ -22,13 +22,47 @@ meson setup builddir --native-file meson-native-clang-gcc.ini
 
 # Build
 ninja -C builddir
-
-# Run tests
-meson test -C builddir
-
-# Run a single test
-meson test -C builddir --test-name "ADB test"
 ```
+
+## Testing
+
+### Automatic Tests (无需设备，CI 安全)
+
+```bash
+meson test -C builddir
+```
+
+覆盖 38 个用例：binary.h、input_transform、keycode_map、control_msg、crypto、protocol、adb 初始化。
+
+### Manual Tests (需要设备)
+
+```bash
+# 统一入口：运行所有设备相关测试
+./builddir/tests/test_device.exe <serial>
+
+# 示例
+./builddir/tests/test_device.exe 192.168.13.197:5555
+```
+
+设备测试覆盖 7 个用例：
+- ADB 连接：TCP 连接、握手、断开
+- Server 流程：推送 JAR、元数据、视频通道
+- 视频管线：帧解码、NV12 转换、多帧一致性
+
+**注意：** 设备测试必须通过 `argv[1]` 提供 `host:port`，无默认值。测试前确保设备上没有残留的 scrcpy-server 进程。
+
+### 测试文件
+
+| 文件 | 类型 | 用例数 | 说明 |
+|------|------|--------|------|
+| `test_binary.c` | 自动 | 6 | 字节序读写 |
+| `test_input_transform.c` | 自动 | 6 | 坐标变换 |
+| `test_keycode_map.c` | 自动 | 7 | VK→Android 键码 |
+| `test_control_msg.c` | 自动 | 8 | 消息序列化 |
+| `test_crypto.c` | 自动 | 7 | RSA 密钥/签名 |
+| `test_protocol.c` | 自动 | 2 | 协议 checksum |
+| `test_adb.c` | 自动 | 2 | ADB 初始化 |
+| `test_device.c` | 手动 | 7 | 设备统一入口 |
 
 ## Architecture
 
