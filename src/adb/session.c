@@ -101,8 +101,6 @@ void session_close_channel(adb_connection_t *conn, adb_channel_t *chan) {
 
 void session_handle_message(adb_connection_t *conn, const adb_message_t *msg,
                             const uint8_t *payload) {
-    log_info("ADB msg: cmd=0x%08x arg0=%u arg1=%u data_len=%u",
-             msg->command, msg->arg0, msg->arg1, msg->data_length);
     switch (msg->command) {
         case ADB_CNXN:
             log_info("Device CNXN: banner=%s, version=0x%08x, max_payload=%u",

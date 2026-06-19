@@ -196,6 +196,7 @@ int application_run(application_t *app) {
 
                 render_count++;
                 fps_count++;
+                (void)render_count; /* used for debugging only */
 
                 d3d_context_begin_frame(&app->d3d_ctx);
                 video_renderer_render(&app->renderer, &frame);
