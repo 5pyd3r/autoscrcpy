@@ -9,7 +9,6 @@ struct video_decoder {
     AVCodecParserContext *parser;
     AVFrame *frame;
     AVPacket *packet;
-    AVPacket *parsed_pkt; /* Packet from parser */
 };
 
 video_decoder_t *video_decoder_create(void) {
@@ -17,8 +16,7 @@ video_decoder_t *video_decoder_create(void) {
     if (!decoder) return NULL;
     decoder->frame = av_frame_alloc();
     decoder->packet = av_packet_alloc();
-    decoder->parsed_pkt = av_packet_alloc();
-    if (!decoder->frame || !decoder->packet || !decoder->parsed_pkt) {
+    if (!decoder->frame || !decoder->packet) {
         video_decoder_destroy(decoder);
         return NULL;
     }
@@ -59,92 +57,90 @@ bool video_decoder_init(video_decoder_t *decoder, uint32_t codec_id,
     return true;
 }
 
-/* Try to receive decoded frames, returns true if a frame was received */
-static bool try_receive_frame(video_decoder_t *decoder) {
+/* Try to extract a decoded frame from the decoder */
+static bool extract_frame(video_decoder_t *decoder) {
     int ret = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
     return (ret >= 0);
 }
 
-/* Send a properly framed packet to the decoder */
-static bool send_packet(video_decoder_t *decoder, const uint8_t *data, uint32_t size) {
-    decoder->packet->data = (uint8_t *)data;
-    decoder->packet->size = (int)size;
-    int ret = avcodec_send_packet(decoder->codec_ctx, decoder->packet);
-    return (ret >= 0 || ret == AVERROR(EAGAIN));
+/* Convert decoded YUV420P frame to NV12 */
+static bool frame_to_nv12(const AVFrame *src, video_frame_t *dst) {
+    uint32_t w = src->width;
+    uint32_t h = src->height;
+    dst->width = w;
+    dst->height = h;
+    dst->format = 0; /* NV12 */
+
+    uint32_t nv12_size = w * h + w * (h / 2);
+    dst->data = malloc(nv12_size);
+    if (!dst->data) return false;
+
+    /* Copy Y plane */
+    const uint8_t *y_src = src->data[0];
+    for (uint32_t row = 0; row < h; row++)
+        memcpy(dst->data + row * w, y_src + row * src->linesize[0], w);
+
+    /* Interleave UV planes into NV12 */
+    uint8_t *uv_dst = dst->data + w * h;
+    const uint8_t *u_src = src->data[1];
+    const uint8_t *v_src = src->data[2];
+    int uv_stride = src->linesize[1];
+    for (uint32_t row = 0; row < h / 2; row++)
+        for (uint32_t col = 0; col < w / 2; col++) {
+            uv_dst[row * w + col * 2 + 0] = u_src[row * uv_stride + col];
+            uv_dst[row * w + col * 2 + 1] = v_src[row * uv_stride + col];
+        }
+
+    return true;
 }
 
 bool video_decoder_decode(video_decoder_t *decoder, const uint8_t *data,
                           uint32_t size, video_frame_t *frame) {
     if (!decoder || !decoder->codec_ctx) return false;
 
-    /* Use parser if available for proper NAL framing */
     if (decoder->parser) {
+        /* Use parser for proper NAL framing */
         const uint8_t *buf = data;
         int remaining = (int)size;
 
         while (remaining > 0) {
             int parsed = av_parser_parse2(decoder->parser, decoder->codec_ctx,
-                                          &decoder->parsed_pkt->data, &decoder->parsed_pkt->size,
+                                          &decoder->packet->data, &decoder->packet->size,
                                           buf, remaining, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
             if (parsed < 0) break;
 
             buf += parsed;
             remaining -= parsed;
 
-            /* If parser produced a complete packet, send it */
-            if (decoder->parsed_pkt->size > 0) {
-                send_packet(decoder, decoder->parsed_pkt->data, decoder->parsed_pkt->size);
+            /* If parser produced a complete packet, send to decoder */
+            if (decoder->packet->size > 0) {
+                avcodec_send_packet(decoder->codec_ctx, decoder->packet);
 
                 /* Try to get a decoded frame */
-                if (try_receive_frame(decoder)) {
-                    goto got_frame;
+                if (extract_frame(decoder)) {
+                    return frame_to_nv12(decoder->frame, frame);
                 }
             }
         }
 
-        /* Flush any remaining frames from the decoder */
-        send_packet(decoder, NULL, 0);
-        if (try_receive_frame(decoder)) {
-            goto got_frame;
+        /* Try to get any remaining decoded frames */
+        if (extract_frame(decoder)) {
+            return frame_to_nv12(decoder->frame, frame);
         }
 
         return false;
     }
 
     /* Fallback: raw mode without parser */
-    if (!send_packet(decoder, data, size)) return false;
-    if (!try_receive_frame(decoder)) return false;
+    decoder->packet->data = (uint8_t *)data;
+    decoder->packet->size = (int)size;
+    avcodec_send_packet(decoder->codec_ctx, decoder->packet);
 
-got_frame:
-    {
-        uint32_t w = decoder->frame->width;
-        uint32_t h = decoder->frame->height;
-        frame->width = w;
-        frame->height = h;
-        frame->format = 0; /* NV12 */
-
-        uint32_t nv12_size = w * h + w * (h / 2);
-        frame->data = malloc(nv12_size);
-        if (!frame->data) return false;
-
-        /* Copy Y plane */
-        const uint8_t *y_src = decoder->frame->data[0];
-        for (uint32_t row = 0; row < h; row++)
-            memcpy(frame->data + row * w, y_src + row * decoder->frame->linesize[0], w);
-
-        /* Interleave UV planes into NV12 */
-        uint8_t *uv_dst = frame->data + w * h;
-        const uint8_t *u_src = decoder->frame->data[1];
-        const uint8_t *v_src = decoder->frame->data[2];
-        int uv_stride = decoder->frame->linesize[1];
-        for (uint32_t row = 0; row < h / 2; row++)
-            for (uint32_t col = 0; col < w / 2; col++) {
-                uv_dst[row * w + col * 2 + 0] = u_src[row * uv_stride + col];
-                uv_dst[row * w + col * 2 + 1] = v_src[row * uv_stride + col];
-            }
-
-        return true;
+    if (extract_frame(decoder)) {
+        return frame_to_nv12(decoder->frame, frame);
     }
+
+    return false;
 }
 
 void video_frame_free(video_frame_t *frame) {
@@ -157,6 +153,5 @@ void video_decoder_destroy(video_decoder_t *decoder) {
     if (decoder->codec_ctx) avcodec_free_context(&decoder->codec_ctx);
     if (decoder->frame) av_frame_free(&decoder->frame);
     if (decoder->packet) av_packet_free(&decoder->packet);
-    if (decoder->parsed_pkt) av_packet_free(&decoder->parsed_pkt);
     free(decoder);
 }
