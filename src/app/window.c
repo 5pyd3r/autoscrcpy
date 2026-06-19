@@ -92,9 +92,12 @@ bool window_init(window_t *win, HINSTANCE hInstance, const char *title,
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.lpszClassName = L"AutoScrcpyWindow";
 
-    if (!RegisterClassEx(&wc)) {
-        log_error("Failed to register window class");
-        return false;
+    /* Register class only if not already registered (allows multiple instances) */
+    if (!GetClassInfoEx(hInstance, wc.lpszClassName, &wc)) {
+        if (!RegisterClassEx(&wc)) {
+            log_error("Failed to register window class");
+            return false;
+        }
     }
 
     RECT rect = {0, 0, width, height};

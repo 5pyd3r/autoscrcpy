@@ -112,9 +112,9 @@ bool video_renderer_init(video_renderer_t *renderer, d3d_context_t *ctx) {
 
     /* Load shaders from bytecode */
     if (vs_bytecode_size > 4 && ps_nv12_bytecode_size > 4) {
-        if (!shader_init_from_bytecode(&renderer->shader, ctx->device,
-                                        vs_bytecode, vs_bytecode_size,
-                                        ps_nv12_bytecode, ps_nv12_bytecode_size)) {
+        if (!shader_init(&renderer->shader, ctx->device,
+                         vs_bytecode, vs_bytecode_size,
+                         ps_nv12_bytecode, ps_nv12_bytecode_size)) {
             log_error("Failed to load shaders from bytecode");
             video_renderer_destroy(renderer);
             return false;

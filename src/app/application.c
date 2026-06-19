@@ -248,14 +248,36 @@ static void on_key_event(uint32_t vk, bool down, void *userdata) {
 static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons, uint32_t action, void *userdata) {
     application_t *app = (application_t *)userdata;
     if (!app->options.control || !app->device_width || !app->device_height) return;
+
     int32_t dx, dy;
     input_transform_coords(x, y, &dx, &dy, app->window.width, app->window.height,
                            app->device_width, app->device_height);
-    uint32_t aa = (action == 1) ? 0 : (action == 0) ? 1 : 2;
-    uint32_t ab = (action == 2) ? 0 : ((buttons & 1) ? 1 : ((buttons & 2) ? 2 : 1));
+
+    /* Map window action to Android action: DOWN=0, UP=1, MOVE=2 */
+    uint32_t android_action = (action == 1) ? 0 : (action == 0) ? 1 : 2;
+
+    /* Determine which button caused the event (0 for move) */
+    uint32_t action_button;
+    if (action == 2) {
+        action_button = 0; /* Move events have no specific button */
+    } else if (buttons & 1) {
+        action_button = 1; /* Left button → BUTTON_PRIMARY */
+    } else if (buttons & 2) {
+        action_button = 2; /* Right button → BUTTON_SECONDARY */
+    } else {
+        action_button = 1; /* Default to primary */
+    }
+
+    /* Pressure: full for down, none for up/move */
+    uint16_t pressure = (action == 1) ? 0xFFFF : 0;
+
     uint8_t buf[64];
-    uint32_t args[10] = {aa, 0xFFFFFFFF, 0xFFFFFFFF, (uint32_t)dx, (uint32_t)dy,
-                         app->device_width, app->device_height, (action == 1) ? 0xFFFF : 0, ab, ab};
+    uint32_t args[10] = {
+        android_action, 0xFFFFFFFF, 0xFFFFFFFF,
+        (uint32_t)dx, (uint32_t)dy,
+        (uint32_t)app->device_width, (uint32_t)app->device_height,
+        pressure, action_button, action_button
+    };
     uint32_t len = control_msg_serialize(CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT, args, buf, sizeof(buf));
     if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
 }
