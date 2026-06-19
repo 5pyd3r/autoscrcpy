@@ -128,6 +128,11 @@ int tls_init(void) {
     /* ADB uses anonymous authentication for server */
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
 
+    /* Set short read timeout so ssl_write's internal recv() doesn't block forever.
+     * When ssl_write returns WANT_READ, the internal recv() will timeout quickly,
+     * allowing the caller to retry. */
+    mbedtls_ssl_conf_read_timeout(&conf, 100); /* 100ms */
+
     tls_initialized = 1;
     return 0;
 }
@@ -206,16 +211,18 @@ int tls_send(void *ssl_ctx, const void *buf, int len) {
 
 int tls_recv(void *ssl_ctx, void *buf, int len) {
     tls_ctx_t *ctx = ssl_ctx;
-    int ret = mbedtls_ssl_read(&ctx->ssl, buf, len);
-    /* Non-fatal conditions — return 0 so caller can retry */
-    if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
-        ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
-        ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY ||
-        ret == MBEDTLS_ERR_NET_RECV_FAILED ||
-        ret == MBEDTLS_ERR_SSL_UNEXPECTED_MESSAGE ||
-        ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET)
-        return 0;
-    return ret;
+    for (;;) {
+        int ret = mbedtls_ssl_read(&ctx->ssl, buf, len);
+        if (ret > 0) return ret;
+        if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+            ret == MBEDTLS_ERR_SSL_WANT_WRITE)
+            return 0;
+        if (ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET)
+            continue; /* TLS 1.3 ticket, retry */
+        if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY)
+            return 0;
+        return -1;
+    }
 }
 
 void tls_free(void *ssl_ctx) {

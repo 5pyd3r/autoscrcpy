@@ -52,7 +52,7 @@ main.c → app/ → device/ → adb/
 | `src/adb/` | Native ADB protocol: connection lifecycle (`adb.c`), wire format (`protocol.c`), AUTH/crypto (`crypto.c`, `tls.c`), channel multiplexing (`session.c`). Talks directly to adbd on port 5555. |
 | `src/device/` | Device-side socket management: `server.c` pushes scrcpy-server.jar and starts it; `video_socket.c`/`audio_socket.c`/`control_socket.c` handle the three scrcpy protocol streams; `demuxer.c` parses the scrcpy packet framing. |
 | `src/decode/` | FFmpeg-based decoders for video (H.264/H.265/AV1) and audio (Opus/AAC/FLAC). `frame_buffer` and `packet_queue` provide thread-safe producer/consumer patterns. |
-| `src/render/` | DirectX 11 rendering pipeline: `d3d_context.c` manages device/swapchain, `video_renderer.c` draws NV12 frames via Y/UV textures and HLSL shaders, `shader.c`/`texture.c` wrap D3D resources. |
+| `src/render/` | DirectX 11 rendering pipeline: `d3d_context.c` manages device/swapchain/viewport, `video_renderer.c` draws NV12 frames via single NV12 texture (staging upload) + Y/UV SRVs + aspect-ratio-preserving transform, `shader.c` wraps D3D shader resources. Reference: `reference/d3d_video/src/render/`. |
 | `src/input/` | Win32 input capture: `keyboard.c`, `mouse.c`, `gamepad.c` translate Win32 messages to scrcpy control events. `keycode_map.c` maps VK codes to Android keycodes. |
 | `src/control/` | Control message serialization (`control_msg.c`) and a threaded sender (`controller.c`) with a lock-free queue. Also `clipboard.c` and `power.c`. |
 | `src/audio/` | WASAPI audio playback (`player.c`) with a timing regulator (`regulator.c`). |
@@ -61,18 +61,36 @@ main.c → app/ → device/ → adb/
 
 ### Key Data Flow
 
-1. `server.c` uses ADB to push and execute the scrcpy server JAR on the device
-2. Device opens three sockets: video, audio, control
-3. `video_socket` → `demuxer` → `video_decoder` (FFmpeg) → `video_renderer` (D3D11)
-4. `audio_socket` → `demuxer` → `audio_decoder` (FFmpeg) → `audio_player` (WASAPI)
-5. Win32 input events → `control_msg` serialization → `controller` thread → `control_socket`
+1. `server.c` connects to device adbd via ADB protocol (TCP + TLS handshake)
+2. `server.c` pushes `scrcpy-server.jar` via ADB sync protocol
+3. `server.c` starts scrcpy-server via `adb shell` with `tunnel_forward=true`
+4. `server.c` opens `localabstract:scrcpy` ADB channel for video stream
+5. `server.c` reads metadata (dummy + device_name + codec/dimensions + session_header) from socketpair
+6. `adb_reader_thread` reads ADB WRTE messages, sends OKAY ACKs, writes video data to socketpair
+7. `video_thread` reads raw H.264 from socketpair → FFmpeg decoder → NV12 `shared_frame` (lock-free swap)
+8. Main thread idle loop: `PeekMessage` → if frame ready → `d3d_context_begin_frame` → `video_renderer_render` → `d3d_context_end_frame`
+
+### scrcpy-server Protocol (v3.3.2, tunnel_forward=true)
+
+Video stream data format (bytes sent on the ADB channel):
+```
+[1B dummy=0x00] [64B device_name] [4B codec_id + 4B width + 4B height] [12B session_header] [raw H.264 Annex B stream...]
+```
+
+- Codec IDs: H.264=`0x68323634`, H.265=`0x68323635`, AV1=`0x00617631`
+- All multi-byte integers are big-endian
+- Session header: first byte `0x80` flags, then width/height (may be 0/31, use codec block dimensions)
+- After metadata, data is raw H.264 Annex B (start codes + NAL units), NOT scrcpy packet-framed
 
 ### Threading Model
 
-- **Main thread**: Win32 message loop, D3D11 rendering, input capture
-- **Video thread**: reads from video socket, decodes, signals frame buffer
-- **Audio thread**: reads from audio socket, decodes, writes to audio player
-- **Controller thread**: drains control message queue, sends to device
+- **Main thread**: Win32 message loop + D3D11 rendering (PeekMessage idle pattern from reference/d3d_video MessageLoop)
+- **ADB reader thread**: reads ADB messages from device, sends OKAY flow control, writes video data to socketpair
+- **Video thread**: reads H.264 from socketpair, decodes via FFmpeg, writes NV12 frames to `shared_frame` via `InterlockedExchangePointer` (no D3D operations)
+- **Audio thread**: reads from audio socket, decodes, writes to audio player (currently disabled)
+- **Controller thread**: drains control message queue, sends to device (currently disabled)
+
+**Important**: D3D11 device is created on the main thread (same thread as the Win32 window — DXGI requirement). D3D11 multi-threaded protection is enabled via `ID3D10Multithread::SetMultithreadProtected(TRUE)` as a safety net.
 
 ## Third-Party Dependencies
 
@@ -102,12 +120,37 @@ Win32 system libraries linked directly: d3d11, dxgi, user32, kernel32, gdi32, ws
 - Never commit directly to main without going through a feature branch
 - Use `git worktree` for isolated branch work when needed
 
+## Project Status
+
+### Working
+- ✅ ADB connection to device (TCP/IP, TLS handshake, AUTH)
+- ✅ Push scrcpy-server.jar via ADB sync protocol
+- ✅ Start scrcpy-server via adb shell
+- ✅ Video channel negotiation (localabstract:scrcpy)
+- ✅ H.264 video decoding (FFmpeg, raw Annex B via `avcodec_send_packet`)
+- ✅ D3D11 NV12 video rendering (single NV12 texture + staging upload + R8/R8G8 SRVs + HLSL shaders)
+- ✅ Aspect ratio correction (letterbox/pillarbox via vertex transform matrix)
+- ✅ Window resize → D3D resize + aspect ratio update
+- ✅ Main-thread rendering with PeekMessage idle loop (reference MessageLoop pattern)
+
+### Not Yet Working
+- ❌ Audio streaming (server started with `audio=false`)
+- ❌ Control input (server started with `control=false`)
+- ❌ Recording
+- ❌ Clipboard sync
+
+### Known Issues
+- H.264 `No start code is found` errors — raw `recv()` chunks may not align with NAL boundaries; decoder self-recovers
+- H.264 P-frame `concealing errors` — caused by initial data misalignment or socketpair buffer overflow
+- First few frames may have artifacts until decoder accumulates reference frames (SPS/PPS)
+
 ## Reference Code
 
 `reference/` contains read-only reference repositories:
 - `reference/scrcpy/` — upstream scrcpy source (protocol and architecture reference)
-- `reference/adb-impl/` — ADB protocol implementation reference
-- `reference/d3d_video/` — D3D11 video rendering reference
+- `reference/adb/` — ADB protocol implementation reference
+- `reference/adb-server/` — ADB server reference
+- `reference/d3d_video/` — D3D11 video rendering reference (SwapChainManager, VideoQuad, TextureUpdater, MessageLoop)
 
 **Never modify files under `reference/`.**
 

@@ -14,6 +14,14 @@
 #include "../device/server.h"
 #include <stdbool.h>
 
+/* Shared frame: video thread decodes, main thread renders */
+typedef struct {
+    uint8_t *data;       /* NV12 pixel data (freed by consumer) */
+    uint32_t width;
+    uint32_t height;
+    volatile LONG ready; /* 1 = frame available, 0 = consumed */
+} shared_frame_t;
+
 typedef struct {
     struct scrcpy_options options;
     window_t window;
@@ -32,6 +40,7 @@ typedef struct {
     bool running;
     uint32_t device_width;
     uint32_t device_height;
+    shared_frame_t shared_frame;
 } application_t;
 
 bool application_init(application_t *app, const struct scrcpy_options *options);

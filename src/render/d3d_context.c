@@ -1,5 +1,6 @@
 #include "d3d_context.h"
 #include "../platform/log.h"
+#include <stdio.h>
 
 bool d3d_context_init(d3d_context_t *ctx, HWND hwnd, int width, int height) {
     ctx->width = width;
@@ -32,6 +33,19 @@ bool d3d_context_init(d3d_context_t *ctx, HWND hwnd, int width, int height) {
         return false;
     }
 
+    /* Enable multi-threaded protection so the video thread can render
+     * while the main thread processes Win32 messages */
+    {
+        ID3D10Multithread *mt = NULL;
+        hr = ctx->device_ctx->lpVtbl->QueryInterface(
+            ctx->device_ctx, &IID_ID3D10Multithread, (void **)&mt);
+        if (SUCCEEDED(hr) && mt) {
+            mt->lpVtbl->SetMultithreadProtected(mt, TRUE);
+            mt->lpVtbl->Release(mt);
+            log_info("D3D11 multi-threaded protection enabled");
+        }
+    }
+
     // Create render target view
     ID3D11Texture2D *back_buffer;
     hr = ctx->swap_chain->lpVtbl->GetBuffer(ctx->swap_chain, 0, &IID_ID3D11Texture2D, (void **)&back_buffer);
@@ -47,6 +61,12 @@ bool d3d_context_init(d3d_context_t *ctx, HWND hwnd, int width, int height) {
         log_error("Failed to create render target view: 0x%08x", hr);
         return false;
     }
+
+    /* Bind render target and set viewport */
+    ctx->device_ctx->lpVtbl->OMSetRenderTargets(ctx->device_ctx, 1, &ctx->rtv, NULL);
+
+    D3D11_VIEWPORT vp = {0, 0, (FLOAT)width, (FLOAT)height, 0, 1};
+    ctx->device_ctx->lpVtbl->RSSetViewports(ctx->device_ctx, 1, &vp);
 
     return true;
 }
@@ -88,12 +108,25 @@ void d3d_context_resize(d3d_context_t *ctx, int width, int height) {
 }
 
 void d3d_context_begin_frame(d3d_context_t *ctx) {
+    /* Rebind render target and viewport every frame (may have changed after resize) */
+    ctx->device_ctx->lpVtbl->OMSetRenderTargets(ctx->device_ctx, 1, &ctx->rtv, NULL);
+
+    D3D11_VIEWPORT vp = {0, 0, (FLOAT)ctx->width, (FLOAT)ctx->height, 0, 1};
+    ctx->device_ctx->lpVtbl->RSSetViewports(ctx->device_ctx, 1, &vp);
+
     float clear_color[4] = {0, 0, 0, 1};
     ctx->device_ctx->lpVtbl->ClearRenderTargetView(ctx->device_ctx, ctx->rtv, clear_color);
 }
 
 void d3d_context_end_frame(d3d_context_t *ctx) {
-    ctx->swap_chain->lpVtbl->Present(ctx->swap_chain, 1, 0);
+    /* Present with SyncInterval=0 for no VSync (lowest latency) */
+    HRESULT hr = ctx->swap_chain->lpVtbl->Present(ctx->swap_chain, 0, 0);
+    if (FAILED(hr)) {
+        static int present_errors = 0;
+        present_errors++;
+        if (present_errors <= 3)
+            fprintf(stderr, "D3D: Present failed: 0x%08x\n", hr);
+    }
 }
 
 void d3d_context_destroy(d3d_context_t *ctx) {

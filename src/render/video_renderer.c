@@ -2,22 +2,25 @@
 #include "shader_bytecode.h"
 #include "../platform/log.h"
 #include <string.h>
+#include <stdio.h>
+#include <math.h>
 
 typedef struct {
     float x, y, z;
     float u, v;
 } vertex_t;
 
-static const vertex_t vertices[] = {
+/* Full-screen quad vertices (will be scaled by transform matrix for aspect ratio) */
+static const vertex_t quad_vertices[] = {
     {-1,  1, 0, 0, 0},
     { 1,  1, 0, 1, 0},
     { 1, -1, 0, 1, 1},
     {-1, -1, 0, 0, 1},
 };
 
-static const uint16_t indices[] = {0, 1, 2, 0, 2, 3};
+static const uint16_t quad_indices[] = {0, 1, 2, 0, 2, 3};
 
-/* Identity transform matrix (row-major) */
+/* Identity transform matrix (row-major, 4x4) */
 static const float identity_matrix[16] = {
     1, 0, 0, 0,
     0, 1, 0, 0,
@@ -29,18 +32,24 @@ bool video_renderer_init(video_renderer_t *renderer, d3d_context_t *ctx) {
     renderer->d3d_ctx = ctx;
     renderer->video_width = 0;
     renderer->video_height = 0;
+    renderer->window_width = (uint32_t)ctx->width;
+    renderer->window_height = (uint32_t)ctx->height;
     renderer->initialized = false;
     renderer->cb = NULL;
     renderer->sampler = NULL;
+    renderer->nv12_tex = NULL;
+    renderer->nv12_staging = NULL;
+    renderer->y_srv = NULL;
+    renderer->uv_srv = NULL;
 
     /* Create vertex buffer */
     D3D11_BUFFER_DESC vb_desc = {0};
-    vb_desc.ByteWidth = sizeof(vertices);
+    vb_desc.ByteWidth = sizeof(quad_vertices);
     vb_desc.Usage = D3D11_USAGE_IMMUTABLE;
     vb_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
 
     D3D11_SUBRESOURCE_DATA vb_data = {0};
-    vb_data.pSysMem = vertices;
+    vb_data.pSysMem = quad_vertices;
 
     HRESULT hr = ctx->device->lpVtbl->CreateBuffer(ctx->device, &vb_desc, &vb_data, &renderer->vb);
     if (FAILED(hr)) {
@@ -50,12 +59,12 @@ bool video_renderer_init(video_renderer_t *renderer, d3d_context_t *ctx) {
 
     /* Create index buffer */
     D3D11_BUFFER_DESC ib_desc = {0};
-    ib_desc.ByteWidth = sizeof(indices);
+    ib_desc.ByteWidth = sizeof(quad_indices);
     ib_desc.Usage = D3D11_USAGE_IMMUTABLE;
     ib_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
 
     D3D11_SUBRESOURCE_DATA ib_data = {0};
-    ib_data.pSysMem = indices;
+    ib_data.pSysMem = quad_indices;
 
     hr = ctx->device->lpVtbl->CreateBuffer(ctx->device, &ib_desc, &ib_data, &renderer->ib);
     if (FAILED(hr)) {
@@ -79,7 +88,7 @@ bool video_renderer_init(video_renderer_t *renderer, d3d_context_t *ctx) {
         return false;
     }
 
-    /* Create sampler state */
+    /* Create sampler state (clamp to edge, bilinear) */
     D3D11_SAMPLER_DESC samp_desc = {0};
     samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     samp_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -112,154 +121,193 @@ bool video_renderer_init(video_renderer_t *renderer, d3d_context_t *ctx) {
     return true;
 }
 
-static bool ensure_textures(video_renderer_t *renderer, uint32_t width, uint32_t height) {
+/* Create/recreate the NV12 textures (shader resource + staging) and SRVs */
+static bool ensure_nv12_texture(video_renderer_t *renderer, uint32_t width, uint32_t height) {
     if (renderer->video_width == width && renderer->video_height == height) {
         return true;
     }
 
-    /* Destroy old textures */
-    texture_destroy(&renderer->y_tex);
-    texture_destroy(&renderer->uv_tex);
+    /* Release old resources */
+    if (renderer->y_srv)  { renderer->y_srv->lpVtbl->Release(renderer->y_srv);  renderer->y_srv = NULL; }
+    if (renderer->uv_srv) { renderer->uv_srv->lpVtbl->Release(renderer->uv_srv); renderer->uv_srv = NULL; }
+    if (renderer->nv12_tex) { renderer->nv12_tex->lpVtbl->Release(renderer->nv12_tex); renderer->nv12_tex = NULL; }
+    if (renderer->nv12_staging) { renderer->nv12_staging->lpVtbl->Release(renderer->nv12_staging); renderer->nv12_staging = NULL; }
 
-    /* Create Y texture (R8_UNORM, full resolution) */
-    D3D11_TEXTURE2D_DESC y_desc = {0};
-    y_desc.Width = width;
-    y_desc.Height = height;
-    y_desc.MipLevels = 1;
-    y_desc.ArraySize = 1;
-    y_desc.Format = DXGI_FORMAT_R8_UNORM;
-    y_desc.SampleDesc.Count = 1;
-    y_desc.Usage = D3D11_USAGE_DYNAMIC;
-    y_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    y_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    /* Create NV12 shader resource texture (GPU-readable, DEFAULT usage) */
+    D3D11_TEXTURE2D_DESC desc = {0};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
     HRESULT hr = renderer->d3d_ctx->device->lpVtbl->CreateTexture2D(
-        renderer->d3d_ctx->device, &y_desc, NULL, &renderer->y_tex.texture);
+        renderer->d3d_ctx->device, &desc, NULL, &renderer->nv12_tex);
     if (FAILED(hr)) {
-        log_error("Failed to create Y texture: 0x%08x", hr);
+        log_error("Failed to create NV12 texture: 0x%08x", hr);
         return false;
     }
 
+    /* Create NV12 staging texture (CPU-writable, for uploading frame data) */
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    hr = renderer->d3d_ctx->device->lpVtbl->CreateTexture2D(
+        renderer->d3d_ctx->device, &staging_desc, NULL, &renderer->nv12_staging);
+    if (FAILED(hr)) {
+        log_error("Failed to create NV12 staging texture: 0x%08x", hr);
+        return false;
+    }
+
+    /* Create luminance SRV (R8_UNORM reads the Y plane) */
     D3D11_SHADER_RESOURCE_VIEW_DESC y_srv_desc = {0};
-    y_srv_desc.Format = y_desc.Format;
+    y_srv_desc.Format = DXGI_FORMAT_R8_UNORM;
     y_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    y_srv_desc.Texture2D.MostDetailedMip = 0;
     y_srv_desc.Texture2D.MipLevels = 1;
 
     hr = renderer->d3d_ctx->device->lpVtbl->CreateShaderResourceView(
-        renderer->d3d_ctx->device, (ID3D11Resource *)renderer->y_tex.texture,
-        &y_srv_desc, &renderer->y_tex.srv);
+        renderer->d3d_ctx->device, (ID3D11Resource *)renderer->nv12_tex,
+        &y_srv_desc, &renderer->y_srv);
     if (FAILED(hr)) {
         log_error("Failed to create Y SRV: 0x%08x", hr);
         return false;
     }
-    renderer->y_tex.width = width;
-    renderer->y_tex.height = height;
 
-    /* Create UV texture (R8G8_UNORM, half resolution) */
-    D3D11_TEXTURE2D_DESC uv_desc = {0};
-    uv_desc.Width = width / 2;
-    uv_desc.Height = height / 2;
-    uv_desc.MipLevels = 1;
-    uv_desc.ArraySize = 1;
-    uv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
-    uv_desc.SampleDesc.Count = 1;
-    uv_desc.Usage = D3D11_USAGE_DYNAMIC;
-    uv_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    uv_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-    hr = renderer->d3d_ctx->device->lpVtbl->CreateTexture2D(
-        renderer->d3d_ctx->device, &uv_desc, NULL, &renderer->uv_tex.texture);
-    if (FAILED(hr)) {
-        log_error("Failed to create UV texture: 0x%08x", hr);
-        return false;
-    }
-
+    /* Create chrominance SRV (R8G8_UNORM reads the UV plane) */
     D3D11_SHADER_RESOURCE_VIEW_DESC uv_srv_desc = {0};
-    uv_srv_desc.Format = uv_desc.Format;
+    uv_srv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
     uv_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    uv_srv_desc.Texture2D.MostDetailedMip = 0;
     uv_srv_desc.Texture2D.MipLevels = 1;
 
     hr = renderer->d3d_ctx->device->lpVtbl->CreateShaderResourceView(
-        renderer->d3d_ctx->device, (ID3D11Resource *)renderer->uv_tex.texture,
-        &uv_srv_desc, &renderer->uv_tex.srv);
+        renderer->d3d_ctx->device, (ID3D11Resource *)renderer->nv12_tex,
+        &uv_srv_desc, &renderer->uv_srv);
     if (FAILED(hr)) {
         log_error("Failed to create UV SRV: 0x%08x", hr);
         return false;
     }
-    renderer->uv_tex.width = width / 2;
-    renderer->uv_tex.height = height / 2;
 
     renderer->video_width = width;
     renderer->video_height = height;
 
-    log_info("Created NV12 textures: %ux%u", width, height);
+    log_info("Created NV12 texture: %ux%u", width, height);
     return true;
 }
 
-static bool update_nv12_textures(video_renderer_t *renderer,
-                                  const uint8_t *nv12_data,
-                                  uint32_t width, uint32_t height) {
-    /* Update Y plane */
+/* Update the NV12 texture with new frame data via staging texture.
+ * NV12 layout: Y plane (width * height bytes) + UV plane (width * height/2 bytes).
+ * The staging texture is mapped, data is copied in, then CopyResource uploads to GPU. */
+static bool update_nv12_texture(video_renderer_t *renderer,
+                                 const uint8_t *nv12_data,
+                                 uint32_t width, uint32_t height) {
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr = renderer->d3d_ctx->device_ctx->lpVtbl->Map(
-        renderer->d3d_ctx->device_ctx, (ID3D11Resource *)renderer->y_tex.texture,
-        0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        renderer->d3d_ctx->device_ctx, (ID3D11Resource *)renderer->nv12_staging,
+        0, D3D11_MAP_WRITE, 0, &mapped);
     if (FAILED(hr)) return false;
 
+    /* Copy Y plane */
     const uint8_t *y_src = nv12_data;
     for (uint32_t row = 0; row < height; row++) {
         memcpy((uint8_t *)mapped.pData + row * mapped.RowPitch,
                y_src + row * width, width);
     }
-    renderer->d3d_ctx->device_ctx->lpVtbl->Unmap(
-        renderer->d3d_ctx->device_ctx, (ID3D11Resource *)renderer->y_tex.texture, 0);
 
-    /* Update UV plane */
-    hr = renderer->d3d_ctx->device_ctx->lpVtbl->Map(
-        renderer->d3d_ctx->device_ctx, (ID3D11Resource *)renderer->uv_tex.texture,
-        0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) return false;
-
+    /* Copy UV plane (starts after Y plane in NV12, height/2 rows, width bytes each) */
     const uint8_t *uv_src = nv12_data + width * height;
-    uint32_t uv_width = width; /* NV12 UV row is same width (interleaved U+V) */
-    uint32_t uv_height = height / 2;
-    for (uint32_t row = 0; row < uv_height; row++) {
-        memcpy((uint8_t *)mapped.pData + row * mapped.RowPitch,
-               uv_src + row * uv_width, uv_width);
+    uint8_t *uv_dst = (uint8_t *)mapped.pData + mapped.RowPitch * height;
+    for (uint32_t row = 0; row < height / 2; row++) {
+        memcpy(uv_dst + row * mapped.RowPitch,
+               uv_src + row * width, width);
     }
+
     renderer->d3d_ctx->device_ctx->lpVtbl->Unmap(
-        renderer->d3d_ctx->device_ctx, (ID3D11Resource *)renderer->uv_tex.texture, 0);
+        renderer->d3d_ctx->device_ctx, (ID3D11Resource *)renderer->nv12_staging, 0);
+
+    /* Copy staging texture to shader resource texture */
+    renderer->d3d_ctx->device_ctx->lpVtbl->CopyResource(
+        renderer->d3d_ctx->device_ctx,
+        (ID3D11Resource *)renderer->nv12_tex,
+        (ID3D11Resource *)renderer->nv12_staging);
 
     return true;
+}
+
+/* Update the constant buffer with an aspect-ratio-preserving transform matrix.
+ * Matches reference VideoQuad::UpdateByRatio logic. */
+static void update_aspect_ratio_transform(video_renderer_t *renderer) {
+    if (renderer->video_width == 0 || renderer->video_height == 0) return;
+    if (renderer->window_width == 0 || renderer->window_height == 0) return;
+
+    double src_ratio = (double)renderer->video_width / renderer->video_height;
+    double dst_ratio = (double)renderer->window_width / renderer->window_height;
+
+    float sx = 1.0f, sy = 1.0f;
+    if (src_ratio > dst_ratio) {
+        /* Video is wider than window → shrink Y (letterbox top/bottom) */
+        sy = (float)(dst_ratio / src_ratio);
+    } else if (src_ratio < dst_ratio) {
+        /* Video is taller than window → shrink X (pillarbox left/right) */
+        sx = (float)(src_ratio / dst_ratio);
+    }
+
+    /* Build scale matrix (row-major) */
+    float matrix[16] = {
+        sx,  0,  0,  0,
+         0, sy,  0,  0,
+         0,  0,  1,  0,
+         0,  0,  0,  1,
+    };
+
+    /* Upload to constant buffer */
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = renderer->d3d_ctx->device_ctx->lpVtbl->Map(
+        renderer->d3d_ctx->device_ctx, (ID3D11Resource *)renderer->cb,
+        0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr)) {
+        memcpy(mapped.pData, matrix, 64);
+        renderer->d3d_ctx->device_ctx->lpVtbl->Unmap(
+            renderer->d3d_ctx->device_ctx, (ID3D11Resource *)renderer->cb, 0);
+    }
 }
 
 bool video_renderer_render(video_renderer_t *renderer, const video_frame_t *frame) {
     if (!renderer->initialized || !frame || !frame->data) return false;
 
-    /* Ensure textures are created for this frame size */
-    if (!ensure_textures(renderer, frame->width, frame->height)) {
+    /* Ensure NV12 texture is created for this frame size */
+    if (!ensure_nv12_texture(renderer, frame->width, frame->height)) {
         return false;
     }
 
-    /* Update NV12 textures */
-    if (!update_nv12_textures(renderer, frame->data, frame->width, frame->height)) {
+    /* Update NV12 texture with frame data */
+    if (!update_nv12_texture(renderer, frame->data, frame->width, frame->height)) {
         return false;
     }
 
-    /* Bind shader */
+    /* Update aspect ratio transform */
+    update_aspect_ratio_transform(renderer);
+
+    /* Bind shader + input layout */
     shader_bind(&renderer->shader, renderer->d3d_ctx->device_ctx);
 
-    /* Bind textures */
+    /* Bind NV12 SRVs: slot 0 = luminance (Y), slot 1 = chrominance (UV) */
     renderer->d3d_ctx->device_ctx->lpVtbl->PSSetShaderResources(
-        renderer->d3d_ctx->device_ctx, 0, 1, &renderer->y_tex.srv);
+        renderer->d3d_ctx->device_ctx, 0, 1, &renderer->y_srv);
     renderer->d3d_ctx->device_ctx->lpVtbl->PSSetShaderResources(
-        renderer->d3d_ctx->device_ctx, 1, 1, &renderer->uv_tex.srv);
+        renderer->d3d_ctx->device_ctx, 1, 1, &renderer->uv_srv);
 
     /* Bind sampler */
     renderer->d3d_ctx->device_ctx->lpVtbl->PSSetSamplers(
         renderer->d3d_ctx->device_ctx, 0, 1, &renderer->sampler);
 
-    /* Bind constant buffer */
+    /* Bind constant buffer (transform matrix) */
     renderer->d3d_ctx->device_ctx->lpVtbl->VSSetConstantBuffers(
         renderer->d3d_ctx->device_ctx, 0, 1, &renderer->cb);
 
@@ -280,10 +328,17 @@ bool video_renderer_render(video_renderer_t *renderer, const video_frame_t *fram
     return true;
 }
 
+void video_renderer_set_window_size(video_renderer_t *renderer, uint32_t width, uint32_t height) {
+    renderer->window_width = width;
+    renderer->window_height = height;
+}
+
 void video_renderer_destroy(video_renderer_t *renderer) {
     shader_destroy(&renderer->shader);
-    texture_destroy(&renderer->y_tex);
-    texture_destroy(&renderer->uv_tex);
+    if (renderer->y_srv)  { renderer->y_srv->lpVtbl->Release(renderer->y_srv);  renderer->y_srv = NULL; }
+    if (renderer->uv_srv) { renderer->uv_srv->lpVtbl->Release(renderer->uv_srv); renderer->uv_srv = NULL; }
+    if (renderer->nv12_tex) { renderer->nv12_tex->lpVtbl->Release(renderer->nv12_tex); renderer->nv12_tex = NULL; }
+    if (renderer->nv12_staging) { renderer->nv12_staging->lpVtbl->Release(renderer->nv12_staging); renderer->nv12_staging = NULL; }
     if (renderer->vb) renderer->vb->lpVtbl->Release(renderer->vb);
     if (renderer->ib) renderer->ib->lpVtbl->Release(renderer->ib);
     if (renderer->cb) renderer->cb->lpVtbl->Release(renderer->cb);

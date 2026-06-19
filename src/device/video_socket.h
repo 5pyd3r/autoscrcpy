@@ -10,6 +10,8 @@ typedef struct {
     uint32_t codec_id;
     uint32_t width;
     uint32_t height;
+    uint8_t *pending;       /* pending bytes from header pre-read */
+    uint32_t pending_size;  /* number of pending bytes */
 } video_socket_t;
 
 bool video_socket_init(video_socket_t *sock, SOCKET_T fd);

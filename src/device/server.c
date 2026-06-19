@@ -62,6 +62,11 @@ static adb_connection_t *do_adb_connect(const char *host, uint16_t port) {
         return NULL;
     }
     conn->fd = fd;
+    /* Disable Nagle's algorithm so small packets (OKAY ACKs) are sent immediately */
+    {
+        int flag = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
+    }
     log_info("TCP connected to %s:%u", host, port);
 
     /* Send CNXN */
@@ -117,7 +122,7 @@ static adb_connection_t *do_adb_connect(const char *host, uint16_t port) {
 
             conn->tls_ctx = tls_handshake(fd);
             if (!conn->tls_ctx) { log_error("TLS handshake failed"); goto fail; }
-            log_info("TLS handshake OK");
+            log_info("TLS handshake OK, tls_ctx=%p", conn->tls_ctx);
 
             /* Per reference: after TLS handshake, device speaks first.
              * Wait for device AUTH/CNXN before sending our CNXN. */
@@ -186,7 +191,10 @@ static adb_connection_t *do_adb_connect(const char *host, uint16_t port) {
         }
     }
 
-    if (conn->state == ADB_STATE_CONNECTED) return conn;
+    if (conn->state == ADB_STATE_CONNECTED) {
+        log_info("do_adb_connect returning: tls_ctx=%p", conn->tls_ctx);
+        return conn;
+    }
 
 fail:
     CLOSESOCKET(fd);
@@ -221,6 +229,14 @@ static int create_socketpair(SOCKET_T fds[2]) {
     fds[1] = accept(listen_fd, NULL, NULL);
     CLOSESOCKET(listen_fd);
     if (fds[1] == INVALID_SOCKFD) { CLOSESOCKET(fds[0]); return -1; }
+    /* Increase buffers to hold several seconds of video data.
+     * At 1080p30 with H.264, typical bitrate is ~4Mbps = 500KB/s.
+     * 64MB buffer = ~2 minutes of data — should never fill up. */
+    {
+        int bufsize = 64 * 1024 * 1024; /* 64MB */
+        setsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, (const char *)&bufsize, sizeof(bufsize));
+        setsockopt(fds[0], SOL_SOCKET, SO_RCVBUF, (const char *)&bufsize, sizeof(bufsize));
+    }
     return 0;
 }
 
@@ -279,22 +295,127 @@ static void relay_extract_msg(relay_buf_t *rb, adb_message_t *out_hdr,
     rb->expect = 0;
 }
 
-/* Send OKAY ack for a WRTE message. Retries on WANT_WRITE. */
-static void relay_send_okay(fwd_relay_t *r) {
-    adb_message_t okay;
-    okay.command = ADB_OKAY;
-    okay.arg0 = r->chan->local_id;
-    okay.arg1 = r->chan->remote_id;
-    okay.data_length = 0;
-    okay.data_check = 0;
-    okay.magic = ADB_OKAY ^ 0xFFFFFFFF;
-    for (int i = 0; i < 200; i++) {
-        int n = tls_send(r->adb_conn->tls_ctx, &okay, ADB_MSG_HEADER_SIZE);
-        if (n > 0) return;
-        if (n < 0) { fprintf(stderr, "R:OKAY err\n"); return; }
-        SwitchToThread();
+/* OKAY ACK queue — decouples read from write to avoid TLS deadlock */
+#define OKAY_QUEUE_SIZE 64
+typedef struct {
+    uint32_t local_id;
+    uint32_t remote_id;
+} okay_entry_t;
+
+/* ADB I/O thread: single-threaded event loop for reading and writing.
+ * Uses non-blocking TLS. ssl_write WANT_READ is handled by skipping
+ * the write and retrying on the next iteration (after ssl_read drains
+ * any pending TLS control records). */
+typedef struct {
+    adb_connection_t *conn;
+    adb_channel_t    *video_chan;
+    SOCKET_T          video_write_fd; /* write end of socketpair */
+    volatile int      running;
+} adb_reader_t;
+
+/* Video data buffer for accumulating WRTE payloads during setup phase */
+typedef struct {
+    uint8_t *data;
+    uint32_t used;
+    uint32_t capacity;
+} video_buf_t;
+
+static void video_buf_init(video_buf_t *vb) {
+    vb->capacity = 256 * 1024; /* 256KB initial */
+    vb->data = malloc(vb->capacity);
+    vb->used = 0;
+}
+
+static void video_buf_append(video_buf_t *vb, const uint8_t *src, uint32_t len) {
+    if (vb->used + len > vb->capacity) {
+        vb->capacity = (vb->used + len) * 2;
+        vb->data = realloc(vb->data, vb->capacity);
     }
-    fprintf(stderr, "R:OKAY timeout\n");
+    memcpy(vb->data + vb->used, src, len);
+    vb->used += len;
+}
+
+static void video_buf_free(video_buf_t *vb) {
+    free(vb->data);
+    vb->data = NULL;
+    vb->used = 0;
+}
+
+static DWORD WINAPI adb_reader_thread(LPVOID arg) {
+    adb_reader_t *r = (adb_reader_t *)arg;
+    uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
+    if (!pl) return 0;
+
+    /* Per-channel stats for diagnostics */
+    uint32_t video_bytes = 0, video_count = 0;
+    uint32_t other_bytes = 0, other_count = 0;
+    uint32_t total_msgs = 0;
+    DWORD last_log = GetTickCount();
+
+    while (r->running) {
+        adb_message_t msg;
+        memset(&msg, 0, sizeof(msg));
+        int ret = adb_recv_msg_conn(r->conn, &msg, pl, ADB_MAX_PAYLOAD, 1);
+        if (ret <= 0) break;
+        total_msgs++;
+
+        /* Periodic stats every 3 seconds */
+        DWORD now = GetTickCount();
+        if (now - last_log > 3000) {
+            fprintf(stderr, "[reader] stats: total=%u video=%u/%uB other=%u/%uB\n",
+                    total_msgs, video_count, video_bytes, other_count, other_bytes);
+            fflush(stderr);
+            last_log = now;
+        }
+
+        if (msg.command == ADB_WRTE) {
+            /* Update remote_id from first WRTE if not yet set by OKAY */
+            if (r->video_chan->remote_id == 0) {
+                r->video_chan->remote_id = msg.arg0;
+            }
+            /* Send OKAY FIRST so device can continue sending.
+             * Then write to socketpair (blocking, but 64MB buffer). */
+            adb_send_msg_conn(r->conn, ADB_OKAY,
+                              msg.arg1 /* our local_id */,
+                              msg.arg0 /* device's remote_id */,
+                              NULL, 0, 1);
+            /* Dispatch video data to socketpair */
+            if (msg.arg0 == r->video_chan->remote_id && msg.data_length > 0) {
+                send(r->video_write_fd, (const char *)pl, msg.data_length, 0);
+                video_count++;
+                video_bytes += msg.data_length;
+            }
+        } else if (msg.command == ADB_OKAY) {
+            /* Handle OKAY — update channel state WITHOUT sending duplicate OKAY.
+             * session_handle_message sends its own OKAY which would corrupt TLS,
+             * so we handle the state update directly here. */
+            uint32_t remote_id = msg.arg0;
+            uint32_t local_id = msg.arg1;
+            for (int i = 0; i < r->conn->channel_count; i++) {
+                if (r->conn->channels[i].local_id == local_id) {
+                    r->conn->channels[i].remote_id = remote_id;
+                    r->conn->channels[i].state = CHAN_OPEN;
+                    break;
+                }
+            }
+            if (local_id == r->video_chan->local_id) {
+                fprintf(stderr, "[reader] Video channel OKAY: remote_id=%u\n", remote_id);
+                fflush(stderr);
+            }
+        } else {
+            session_handle_message(r->conn, &msg, pl);
+        }
+    }
+
+    free(pl);
+    r->running = 0;
+    return 0;
+}
+
+/* Send OKAY ack for a WRTE message using adb_send_msg_conn (handles TLS retries). */
+static void relay_send_okay(fwd_relay_t *r) {
+    adb_send_msg_conn(r->adb_conn, ADB_OKAY,
+                      r->chan->local_id, r->chan->remote_id, NULL, 0, 1);
 }
 
 /* Relay thread: bidirectional data relay between ADB channel and local socket.
@@ -422,6 +543,11 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         return false;
     }
     srv->adb_conn = conn;
+    log_info("max_payload=%zu", conn->max_payload);
+    log_info("TLS context: %s, protocol version: 0x%08x, skip_checksum: %d",
+             conn->tls_ctx ? "SET" : "NULL",
+             conn->protocol_version,
+             conn->protocol_version >= ADB_VERSION_SKIP_CHECKSUM);
 
     /* Set shell output callback to capture server error messages */
     conn->on_shell_output = server_shell_output_cb;
@@ -479,7 +605,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         /* Send SEND command (sync protocol: ID + path_length + path,mode) */
         uint8_t cmd_buf[4 + 4 + 512];
         memcpy(cmd_buf, "SEND", 4);
-        const char *remote = "/data/local/tmp/scrcpy-server.jar";
+        const char *remote = "/data/local/tmp/scrcpy-server";
         char path_mode[512];
         snprintf(path_mode, sizeof(path_mode), "%s,0644", remote);
         uint32_t path_len = (uint32_t)strlen(path_mode);
@@ -558,24 +684,21 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         log_info("Push complete");
     }
 
-    /* Kill old instances */
-    adb_shell(conn, "pkill -f com.genymobile.scrcpy.Server");
-    Sleep(1000);
+    /* Skip killing — test with existing server */
+    // adb_shell(conn, "pkill -f com.genymobile.scrcpy.Server");
+    // Sleep(1000);
 
     /* Start scrcpy-server */
     {
         char cmd[1024];
         snprintf(cmd, sizeof(cmd),
-                 "CLASSPATH=/data/local/tmp/scrcpy-server.jar "
+                 "CLASSPATH=/data/local/tmp/scrcpy-server "
                  "app_process / com.genymobile.scrcpy.Server 3.3.2 "
                  "tunnel_forward=true "
-                 "send_device_meta=true send_frame_meta=true "
-                 "video=%s audio=%s control=%s "
-                 "max_size=%u max_fps=10 video_bit_rate=2000000",
+                 "video=%s audio=%s control=%s",
                  srv->config.video ? "true" : "false",
-                 srv->config.audio ? "true" : "false",
-                 srv->config.control ? "true" : "false",
-                 srv->config.max_size ? srv->config.max_size : 1024);
+                 "false", /* audio off */
+                 "false"  /* control off */);
         log_info("Starting scrcpy-server...");
         if (!adb_shell(conn, cmd)) { log_error("Shell failed"); return false; }
 
@@ -593,133 +716,140 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         }
     }
 
-    /* Create local listener for forward connections */
-    SOCKET_T listen_fd = create_listener(srv->config.local_port);
-    if (listen_fd == INVALID_SOCKFD) {
-        log_error("Failed to create listener on port %u", srv->config.local_port);
+    /* Open ALL channels that the server expects.
+     * scrcpy-server with tunnel_forward=true does blocking accept() for each
+     * channel in order: video → audio → control. We must open all of them
+     * or the server blocks on accept() and never sends data. */
+    adb_channel_t *video_chan = session_open_channel(conn, "localabstract:scrcpy");
+    if (!video_chan) {
+        log_error("Failed to open video channel");
         return false;
     }
 
-    /* Helper: create a forwarded connection to scrcpy-server.
-     * 1. Connect to local listener (client side)
-     * 2. Accept on listener (server side)
-     * 3. Create new TLS connection to adbd
-     * 4. Open "localabstract:scrcpy" channel
-     * 5. Start bidirectional relay thread
-     * Returns client side socket for the caller. */
-    #define CREATE_FWD(label, out_relay) do { \
-        SOCKET_T _client = socket(AF_INET, SOCK_STREAM, 0); \
-        struct sockaddr_in _a; memset(&_a, 0, sizeof(_a)); \
-        _a.sin_family = AF_INET; _a.sin_port = htons(srv->config.local_port); \
-        _a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); \
-        if (connect(_client, (struct sockaddr *)&_a, sizeof(_a)) < 0) { \
-            log_error("Forward " label ": connect failed"); CLOSESOCKET(_client); \
-            CLOSESOCKET(listen_fd); return false; \
-        } \
-        struct sockaddr_in _ca; int _cl = sizeof(_ca); \
-        SOCKET_T _server = accept(listen_fd, (struct sockaddr *)&_ca, &_cl); \
-        if (_server == INVALID_SOCKFD) { \
-            log_error("Forward " label ": accept failed"); CLOSESOCKET(_client); \
-            CLOSESOCKET(listen_fd); return false; \
-        } \
-        adb_connection_t *_fwd_conn = do_adb_connect(device_host, device_port); \
-        if (!_fwd_conn) { \
-            log_error("Forward " label ": adbd connect failed"); \
-            CLOSESOCKET(_client); CLOSESOCKET(_server); \
-            CLOSESOCKET(listen_fd); return false; \
-        } \
-        adb_channel_t *_chan = session_open_channel(_fwd_conn, "localabstract:scrcpy"); \
-        if (!_chan) { \
-            log_error("Forward " label ": channel open failed"); \
-            adb_disconnect(_fwd_conn); CLOSESOCKET(_client); CLOSESOCKET(_server); \
-            CLOSESOCKET(listen_fd); return false; \
-        } \
-        for (int _i = 0; _i < 200; _i++) { \
-            fd_set _rfds; FD_ZERO(&_rfds); FD_SET(_fwd_conn->fd, &_rfds); \
-            struct timeval _tv = {0, 100000}; \
-            if (select(0, &_rfds, NULL, NULL, &_tv) > 0) { \
-                adb_message_t _m; uint8_t _p[4096]; memset(&_m, 0, sizeof(_m)); \
-                if (adb_recv_msg_conn(_fwd_conn, &_m, _p, sizeof(_p), 1) == 1) { \
-                    session_handle_message(_fwd_conn, &_m, _p); \
-                    if (_chan->state == CHAN_OPEN) break; \
-                } \
-            } \
-        } \
-        if (_chan->state != CHAN_OPEN) { \
-            log_error("Forward " label ": channel did not open"); \
-            adb_disconnect(_fwd_conn); CLOSESOCKET(_client); CLOSESOCKET(_server); \
-            CLOSESOCKET(listen_fd); return false; \
-        } \
-        log_info(label " connected (remote_id=%u)", _chan->remote_id); \
-        SET_NONBLOCK(_fwd_conn->fd); \
-        out_relay = calloc(1, sizeof(fwd_relay_t)); \
-        out_relay->adb_conn = _fwd_conn; \
-        out_relay->chan = _chan; \
-        out_relay->local_fd = _server; \
-        out_relay->running = 1; \
-        { HANDLE _th = CreateThread(NULL, 0, fwd_relay_thread, out_relay, 0, NULL); \
-          if (_th) CloseHandle(_th); } \
-        /* Return client side via the macro caller's variable */ \
-        _fwd_client_fd = _client; \
-    } while(0)
+    adb_channel_t *audio_chan = NULL; /* audio disabled */
 
-    /* Connect ALL streams first — scrcpy-server waits for all connections
-     * before sending any data. Order: video, audio, control. */
-    SOCKET_T _fwd_client_fd = INVALID_SOCKFD;
-    fwd_relay_t *video_relay = NULL, *audio_relay = NULL, *ctrl_relay = NULL;
+    adb_channel_t *ctrl_chan = NULL; /* control disabled */
 
-    CREATE_FWD("Video", video_relay);
-    video_sock->fd = _fwd_client_fd;
+    /* Create socketpair for video data relay */
+    SOCKET_T sp[2];
+    if (create_socketpair(sp) < 0) {
+        log_error("Failed to create video socketpair");
+        return false;
+    }
+    video_sock->fd = sp[0];
 
-    if (srv->config.audio) {
-        CREATE_FWD("Audio", audio_relay);
-        audio_sock->fd = _fwd_client_fd;
+    /* Start reader thread — it handles ALL ADB messages:
+     * - OKAY for OPEN (sets channel state)
+     * - WRTE for video (dispatches to socketpair)
+     * - OKAY for WRTE (flow control)
+     * - Shell/control messages */
+    static adb_reader_t reader;
+    reader.conn = conn;
+    reader.video_chan = video_chan;
+    reader.video_write_fd = sp[1];
+    reader.running = 1;
+    HANDLE reader_th = CreateThread(NULL, 0, adb_reader_thread, &reader, 0, NULL);
+    if (reader_th) CloseHandle(reader_th);
+    log_info("ADB reader thread started");
+
+    /* Wait for video channel to open (reader thread processes OKAY) */
+    for (int i = 0; i < 300; i++) {
+        if (video_chan->state == CHAN_OPEN) break;
+        Sleep(100);
+    }
+    if (video_chan->state != CHAN_OPEN) {
+        log_error("Video channel did not open");
+        return false;
+    }
+    log_info("Video channel open (remote_id=%u)", video_chan->remote_id);
+
+    /* Wait for control channel */
+    if (ctrl_chan) {
+        for (int i = 0; i < 300; i++) {
+            if (ctrl_chan->state == CHAN_OPEN) break;
+            Sleep(100);
+        }
+        if (ctrl_chan->state == CHAN_OPEN) {
+            log_info("Control channel open (remote_id=%u)", ctrl_chan->remote_id);
+        } else {
+            log_warn("Control channel did not open");
+        }
     }
 
-    CREATE_FWD("Control", ctrl_relay);
-    control_sock->fd = _fwd_client_fd;
-    { int opt = 1; setsockopt(control_sock->fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&opt, sizeof(opt)); }
+    /* Read video metadata from socketpair (sent by reader thread).
+     * scrcpy-server sends (all defaults enabled):
+     *   dummy(1B) + device_name(64B) + codec_id(4B, BE)
+     * Then the first scrcpy packet is a session header (12B) with width/height,
+     * which will be read by video_socket_read_packet(). */
+    uint8_t dummy_byte;
+    if (recv_exact(video_sock->fd, &dummy_byte, 1) < 0) {
+        log_error("Failed to read video dummy byte");
+        return false;
+    }
 
-    CLOSESOCKET(listen_fd);
-    log_info("All sockets connected, reading metadata...");
-
-    /* Now read video metadata — server starts sending after all sockets connect.
-     * Protocol: 1-byte dummy (forward mode liveness check, discarded) + 64-byte device name */
-    uint8_t dummy;
-    recv_exact(video_sock->fd, &dummy, 1); /* discard liveness byte */
-
-    uint8_t devname[65] = {0};
-    if (recv_exact(video_sock->fd, devname, 64) < 0) {
+    uint8_t devname_buf[64];
+    if (recv_exact(video_sock->fd, devname_buf, 64) < 0) {
         log_error("Failed to read device name");
         return false;
     }
-    log_info("Device: %s", devname);
+    devname_buf[63] = '\0';
+    log_info("Device: %s", devname_buf);
 
-    /* Read codec ID (4 bytes, big-endian) */
-    uint8_t codec_buf[4];
-    if (recv_exact(video_sock->fd, codec_buf, 4) < 0) {
-        log_error("Failed to read codec ID");
+    /* After device_name(64B), scrcpy-server sends codec_id(4B) + width(4B) + height(4B)
+     * as a single 12-byte block, followed by a 12-byte session header (bit 63 set). */
+    uint8_t codec_dim_buf[12];
+    if (recv_exact(video_sock->fd, codec_dim_buf, 12) < 0) {
+        log_error("Failed to read codec/dimensions");
         return false;
     }
-    video_sock->codec_id = ((uint32_t)codec_buf[0]<<24)|((uint32_t)codec_buf[1]<<16)|
-                            ((uint32_t)codec_buf[2]<<8)|(uint32_t)codec_buf[3];
-
-    /* Read width(4BE) + height(4BE) = 8 bytes */
-    uint8_t meta[8];
-    if (recv_exact(video_sock->fd, meta, 8) < 0) {
-        log_error("Failed to read width/height");
-        return false;
-    }
-    video_sock->width = ((uint32_t)meta[0]<<24)|((uint32_t)meta[1]<<16)|
-                         ((uint32_t)meta[2]<<8)|(uint32_t)meta[3];
-    video_sock->height = ((uint32_t)meta[4]<<24)|((uint32_t)meta[5]<<16)|
-                          ((uint32_t)meta[6]<<8)|(uint32_t)meta[7];
+    video_sock->codec_id = ((uint32_t)codec_dim_buf[0]<<24)|((uint32_t)codec_dim_buf[1]<<16)|
+                            ((uint32_t)codec_dim_buf[2]<<8)|(uint32_t)codec_dim_buf[3];
+    /* Width/height from the codec+dimensions block (may be overridden by session header) */
+    uint32_t dim_w = ((uint32_t)codec_dim_buf[4]<<24)|((uint32_t)codec_dim_buf[5]<<16)|
+                      ((uint32_t)codec_dim_buf[6]<<8)|(uint32_t)codec_dim_buf[7];
+    uint32_t dim_h = ((uint32_t)codec_dim_buf[8]<<24)|((uint32_t)codec_dim_buf[9]<<16)|
+                      ((uint32_t)codec_dim_buf[10]<<8)|(uint32_t)codec_dim_buf[11];
 
     const char *cn = "unknown";
     if (video_sock->codec_id == 0x68323634) cn = "H.264";
     else if (video_sock->codec_id == 0x68323635) cn = "H.265";
     else if (video_sock->codec_id == 0x00617631) cn = "AV1";
-    log_info("Video: %s, %ux%u", cn, video_sock->width, video_sock->height);
+    log_info("Video codec: %s (0x%08x), dimensions hint: %ux%u", cn, video_sock->codec_id, dim_w, dim_h);
+
+    /* Use dimensions from the codec block — these are always correct */
+    video_sock->width = dim_w;
+    video_sock->height = dim_h;
+
+    /* Read the session header (12 bytes, first byte = 0x80).
+     * The session header may report different dimensions than the codec block;
+     * we trust the codec block dimensions. After the session header, the device
+     * sends video packets directly. */
+    {
+        uint8_t session_hdr[12];
+        if (recv_exact(video_sock->fd, session_hdr, 12) < 0) {
+            log_error("Failed to read session header");
+            return false;
+        }
+        if (session_hdr[0] & 0x80) {
+            uint32_t sw = ((uint32_t)session_hdr[4]<<24)|((uint32_t)session_hdr[5]<<16)|
+                           ((uint32_t)session_hdr[6]<<8)|(uint32_t)session_hdr[7];
+            uint32_t sh = ((uint32_t)session_hdr[8]<<24)|((uint32_t)session_hdr[9]<<16)|
+                           ((uint32_t)session_hdr[10]<<8)|(uint32_t)session_hdr[11];
+            log_info("Session header: %ux%u (codec block: %ux%u)", sw, sh, dim_w, dim_h);
+        } else {
+            log_info("No session header (byte0=0x%02x), using codec dimensions", session_hdr[0]);
+            /* Save as pending for video receiver */
+            video_sock->pending = malloc(12);
+            if (video_sock->pending) {
+                memcpy(video_sock->pending, session_hdr, 12);
+                video_sock->pending_size = 12;
+            }
+        }
+    }
+
+    srv->adb_conn = conn;
+    srv->video_chan = video_chan;
+    srv->video_read_fd = sp[0];
 
     srv->running = true;
     log_info("Server started successfully");

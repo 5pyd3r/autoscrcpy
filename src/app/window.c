@@ -116,6 +116,9 @@ void window_set_callbacks(window_t *win, const window_callbacks_t *callbacks) {
 void window_show(window_t *win) {
     ShowWindow(win->hwnd, SW_SHOW);
     UpdateWindow(win->hwnd);
+    /* Bring window to foreground */
+    SetForegroundWindow(win->hwnd);
+    SetFocus(win->hwnd);
 }
 
 void window_set_fullscreen(window_t *win, bool fullscreen) {

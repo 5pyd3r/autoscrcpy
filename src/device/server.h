@@ -25,8 +25,10 @@ struct server_config {
 typedef struct server {
     struct server_config config;
     SOCKET_T listen_fd;
-    void *adb_conn;
-    bool running;
+    void *adb_conn;          /* adb_connection_t* */
+    void *video_chan;        /* adb_channel_t* for video stream */
+    SOCKET_T video_read_fd;  /* read end of video socketpair */
+    volatile bool running;
 } server_t;
 
 bool server_init(server_t *srv, const struct server_config *config);
