@@ -23,10 +23,6 @@ int adb_send_msg(SOCKET_T fd, uint32_t cmd, uint32_t arg0, uint32_t arg1,
     msg.data_check = skip_checksum ? 0 : adb_checksum(data, data_len);
     msg.magic = cmd ^ 0xffffffff;
 
-    fprintf(stderr, "DEBUG adb_send_msg: cmd=0x%08x fd=%d data_len=%u\n", cmd, (int)fd, data_len);
-    fflush(stderr);
-
-    /* Send header */
     uint8_t *buf = (uint8_t *)&msg;
     size_t total = ADB_MSG_HEADER_SIZE;
     size_t sent = 0;
@@ -35,30 +31,21 @@ int adb_send_msg(SOCKET_T fd, uint32_t cmd, uint32_t arg0, uint32_t arg1,
         int n = send(fd, (const char *)buf + sent, (int)(total - sent), MSG_NOSIGNAL);
         if (n <= 0) {
             if (n < 0 && SOCKET_ERRNO == WOULDBLOCK_ERR) continue;
-            fprintf(stderr, "DEBUG adb_send_msg: header send failed, n=%d errno=%d\n", n, SOCKET_ERRNO);
-            fflush(stderr);
             return -1;
         }
         sent += n;
     }
-    fprintf(stderr, "DEBUG adb_send_msg: header sent %u bytes\n", (unsigned)sent);
-    fflush(stderr);
 
-    /* Send payload if any */
     if (data_len > 0 && data != NULL) {
         sent = 0;
         while (sent < data_len) {
             int n = send(fd, (const char *)data + sent, (int)(data_len - sent), MSG_NOSIGNAL);
             if (n <= 0) {
                 if (n < 0 && SOCKET_ERRNO == WOULDBLOCK_ERR) continue;
-                fprintf(stderr, "DEBUG adb_send_msg: payload send failed\n");
-                fflush(stderr);
                 return -1;
             }
             sent += n;
         }
-        fprintf(stderr, "DEBUG adb_send_msg: payload sent %u bytes\n", (unsigned)sent);
-        fflush(stderr);
     }
 
     return 0;

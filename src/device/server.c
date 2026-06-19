@@ -262,44 +262,20 @@ static DWORD WINAPI adb_reader_thread(LPVOID arg) {
     uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
     if (!pl) return 0;
 
-    /* Per-channel stats for diagnostics */
-    uint32_t video_bytes = 0, video_count = 0;
-    uint32_t other_bytes = 0, other_count = 0;
-    uint32_t total_msgs = 0;
-    DWORD last_log = GetTickCount();
-
     while (r->running) {
         adb_message_t msg;
         memset(&msg, 0, sizeof(msg));
         int ret = adb_recv_msg_conn(r->conn, &msg, pl, ADB_MAX_PAYLOAD, 1);
         if (ret <= 0) break;
-        total_msgs++;
-
-        /* Periodic stats every 3 seconds */
-        DWORD now = GetTickCount();
-        if (now - last_log > 3000) {
-            fprintf(stderr, "[reader] stats: total=%u video=%u/%uB other=%u/%uB\n",
-                    total_msgs, video_count, video_bytes, other_count, other_bytes);
-            fflush(stderr);
-            last_log = now;
-        }
 
         if (msg.command == ADB_WRTE) {
-            /* Update remote_id from first WRTE if not yet set by OKAY */
             if (r->video_chan->remote_id == 0) {
                 r->video_chan->remote_id = msg.arg0;
             }
-            /* Send OKAY FIRST so device can continue sending.
-             * Then write to socketpair (blocking, but 64MB buffer). */
             adb_send_msg_conn(r->conn, ADB_OKAY,
-                              msg.arg1 /* our local_id */,
-                              msg.arg0 /* device's remote_id */,
-                              NULL, 0, 1);
-            /* Dispatch video data to socketpair */
+                              msg.arg1, msg.arg0, NULL, 0, 1);
             if (msg.arg0 == r->video_chan->remote_id && msg.data_length > 0) {
                 send(r->video_write_fd, (const char *)pl, msg.data_length, 0);
-                video_count++;
-                video_bytes += msg.data_length;
             }
         } else if (msg.command == ADB_OKAY) {
             /* Handle OKAY — update channel state WITHOUT sending duplicate OKAY.
@@ -315,8 +291,7 @@ static DWORD WINAPI adb_reader_thread(LPVOID arg) {
                 }
             }
             if (local_id == r->video_chan->local_id) {
-                fprintf(stderr, "[reader] Video channel OKAY: remote_id=%u\n", remote_id);
-                fflush(stderr);
+                log_info("Video channel OKAY: remote_id=%u", remote_id);
             }
         } else {
             session_handle_message(r->conn, &msg, pl);
@@ -513,11 +488,15 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  "CLASSPATH=/data/local/tmp/scrcpy-server "
                  "app_process / com.genymobile.scrcpy.Server 3.3.2 "
                  "tunnel_forward=true "
-                 "video=%s audio=%s control=%s",
+                 "video=%s audio=%s control=%s "
+                 "video_bit_rate=%u max_size=%u",
                  srv->config.video ? "true" : "false",
                  "false", /* audio off */
-                 "false"  /* control off */);
-        log_info("Starting scrcpy-server...");
+                 "false", /* control off */
+                 srv->config.video_bit_rate,
+                 srv->config.max_size);
+        log_info("Starting scrcpy-server (bitrate=%u, max_size=%u)...",
+                 srv->config.video_bit_rate, srv->config.max_size);
         if (!adb_shell(conn, cmd)) { log_error("Shell failed"); return false; }
 
         /* Drain pending messages (OKAY for shell channel, WRTE with server output) */

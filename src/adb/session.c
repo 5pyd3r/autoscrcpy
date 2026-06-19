@@ -10,11 +10,7 @@
 #define ADB_BANNER "host::features=shell_v2"
 
 SOCKET_T session_connect(const char *host, int port) {
-    fprintf(stderr, "DEBUG session_connect: host=%s port=%d\n", host, port);
-    fflush(stderr);
     SOCKET_T fd = socket(AF_INET, SOCK_STREAM, 0);
-    fprintf(stderr, "DEBUG session_connect: socket fd=%d\n", (int)fd);
-    fflush(stderr);
     if (fd == INVALID_SOCKFD) return INVALID_SOCKFD;
 
     /* Non-blocking connect (reference implementation approach) */
@@ -304,11 +300,8 @@ int session_recv_msg(adb_connection_t *conn, adb_message_t *out_hdr,
 }
 
 int session_poll(adb_connection_t *conn, int timeout_ms) {
-    fprintf(stderr, "DEBUG session_poll ENTER: fd=%d timeout=%d\n", (int)conn->fd, timeout_ms);
-    fflush(stderr);
     if (conn->fd == INVALID_SOCKFD) return -1;
 
-    /* Use select() to check for readability */
     fd_set read_fds;
     FD_ZERO(&read_fds);
     FD_SET(conn->fd, &read_fds);
@@ -318,22 +311,15 @@ int session_poll(adb_connection_t *conn, int timeout_ms) {
     tv.tv_usec = (timeout_ms % 1000) * 1000;
 
     int ret = select(0, &read_fds, NULL, NULL, &tv);
-    fprintf(stderr, "DEBUG session_poll: select returned %d\n", ret);
-    fflush(stderr);
     if (ret <= 0) return ret;
 
-    /* Use adb_recv_msg_conn which handles TLS transparently */
     adb_message_t hdr;
     uint8_t *payload = malloc(ADB_MAX_PAYLOAD);
     if (!payload) return -1;
     int skip = conn->protocol_version >= ADB_VERSION_SKIP_CHECKSUM;
     int n = adb_recv_msg_conn(conn, &hdr, payload, ADB_MAX_PAYLOAD, skip);
-    fprintf(stderr, "DEBUG session_poll: adb_recv_msg_conn returned %d\n", n);
-    fflush(stderr);
     if (n < 0) { free(payload); return -1; }
 
-    fprintf(stderr, "DEBUG session_poll: cmd=0x%08x arg0=%u arg1=%u dlen=%u\n", hdr.command, hdr.arg0, hdr.arg1, hdr.data_length);
-    fflush(stderr);
     session_handle_message(conn, &hdr, payload);
     free(payload);
     return 1;

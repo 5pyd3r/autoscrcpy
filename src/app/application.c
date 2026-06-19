@@ -173,6 +173,10 @@ int application_run(application_t *app) {
      * Pattern from reference/d3d_video MessageLoop. */
     MSG msg = {};
     int render_count = 0;
+    int fps_count = 0;
+    DWORD fps_last_update = GetTickCount();
+    char title_buf[256];
+
     while (app->running) {
         BOOL hasMsg = PeekMessage(&msg, NULL, 0, 0, PM_REMOVE);
         if (hasMsg) {
@@ -183,7 +187,6 @@ int application_run(application_t *app) {
             /* Idle: render latest decoded frame */
             if (app->shared_frame.ready) {
                 shared_frame_t *sf = &app->shared_frame;
-                /* Atomically take ownership of the frame data */
                 video_frame_t frame = {0};
                 frame.data = InterlockedExchangePointer(
                     (volatile PVOID *)&sf->data, NULL);
@@ -192,15 +195,27 @@ int application_run(application_t *app) {
                 InterlockedExchange(&sf->ready, 0);
 
                 render_count++;
-                if (render_count <= 3 || render_count % 300 == 0)
-                    log_info("Render #%d: %ux%u", render_count, frame.width, frame.height);
+                fps_count++;
 
                 d3d_context_begin_frame(&app->d3d_ctx);
                 video_renderer_render(&app->renderer, &frame);
                 d3d_context_end_frame(&app->d3d_ctx);
                 video_frame_free(&frame);
+
+                /* Update window title with video info every second */
+                DWORD now = GetTickCount();
+                if (now - fps_last_update >= 1000) {
+                    float fps = (float)fps_count * 1000.0f / (now - fps_last_update);
+                    fps_count = 0;
+                    fps_last_update = now;
+
+                    snprintf(title_buf, sizeof(title_buf),
+                             "AutoScrcpy - %ux%u @ %.1f FPS | %u kbps",
+                             frame.width, frame.height, fps,
+                             app->options.video_bit_rate / 1000);
+                    SetWindowTextA(app->window.hwnd, title_buf);
+                }
             } else {
-                /* No frame ready, sleep briefly to avoid busy-spin */
                 Sleep(1);
             }
         }

@@ -78,11 +78,7 @@ adb_connection_t *adb_connect(const char *host, uint16_t port) {
     conn->max_payload = ADB_MAX_PAYLOAD;
 
     /* Send CNXN and perform handshake */
-    fprintf(stderr, "DEBUG: sending CNXN...\n");
-    fflush(stderr);
     session_send_cnxn(conn);
-    fprintf(stderr, "DEBUG: CNXN sent, entering handshake loop\n");
-    fflush(stderr);
 
     /* Read device response — use direct select+recv (session_poll has issues) */
     uint8_t *payload = malloc(ADB_MAX_PAYLOAD);
@@ -224,8 +220,6 @@ bool adb_shell(adb_connection_t *conn, const char *command) {
 static bool adb_sync_send(adb_connection_t *conn, adb_channel_t *chan,
                           const char *remote_path, FILE *local_file) {
     /* Wait for channel to open — inline poll to avoid linking issues */
-    fprintf(stderr, "DEBUG adb_sync_send: entered, chan->state=%d\n", chan->state);
-    fflush(stderr);
     log_info("Waiting for sync channel to open... (chan->state=%d, local_id=%u, remote_id=%u)",
              chan->state, chan->local_id, chan->remote_id);
     uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
@@ -233,20 +227,15 @@ static bool adb_sync_send(adb_connection_t *conn, adb_channel_t *chan,
 
     int retries = 200;
     while (chan->state == CHAN_OPENING && retries > 0) {
-        /* Inline: select + recv_msg + handle */
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(conn->fd, &rfds);
         struct timeval tv = {0, 100000}; /* 100ms */
         int sel = select(0, &rfds, NULL, NULL, &tv);
-        fprintf(stderr, "DEBUG adb_sync_send: select=%d retries=%d\n", sel, retries);
-        fflush(stderr);
         if (sel > 0) {
             adb_message_t msg;
             int skip = conn->protocol_version >= ADB_VERSION_SKIP_CHECKSUM;
             int n = adb_recv_msg_conn(conn, &msg, pl, ADB_MAX_PAYLOAD, skip);
-            fprintf(stderr, "DEBUG adb_sync_send: recv=%d cmd=0x%08x\n", n, msg.command);
-            fflush(stderr);
             if (n == 1) {
                 session_handle_message(conn, &msg, pl);
             }
@@ -304,22 +293,16 @@ static bool adb_sync_send(adb_connection_t *conn, adb_channel_t *chan,
 }
 
 bool adb_push(adb_connection_t *conn, const char *local, const char *remote) {
-    fprintf(stderr, "DEBUG adb_push: ENTERED conn=%p local=%s remote=%s\n", (void*)conn, local, remote);
-    fflush(stderr);
     if (!conn || conn->state != ADB_STATE_CONNECTED) {
         log_error("Not connected");
         return false;
     }
 
-    fprintf(stderr, "DEBUG adb_push: opening file %s\n", local);
-    fflush(stderr);
     FILE *fp = fopen(local, "rb");
     if (!fp) {
         log_error("Failed to open local file: %s", local);
         return false;
     }
-    fprintf(stderr, "DEBUG adb_push: file opened, opening sync channel\n");
-    fflush(stderr);
 
     adb_channel_t *chan = session_open_channel(conn, "sync:");
     if (!chan) {
@@ -327,8 +310,6 @@ bool adb_push(adb_connection_t *conn, const char *local, const char *remote) {
         fclose(fp);
         return false;
     }
-    fprintf(stderr, "DEBUG adb_push: sync channel opened, calling adb_sync_send\n");
-    fflush(stderr);
 
     bool ret = adb_sync_send(conn, chan, remote, fp);
 
