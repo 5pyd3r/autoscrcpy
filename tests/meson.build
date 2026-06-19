@@ -95,3 +95,9 @@ test_video_pipeline = executable('test_video_pipeline', 'test_video_pipeline.c',
     '../src/decode/video_decoder.c',
     dependencies: [mbedtls_dep, libavcodec_dep, libavutil_dep] + winlibs,
 )
+
+test_device = executable('test_device', 'test_device.c',
+    test_adb_src, test_server_src,
+    '../src/decode/video_decoder.c',
+    dependencies: [mbedtls_dep, libavcodec_dep, libavutil_dep] + winlibs,
+)
