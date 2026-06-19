@@ -30,9 +30,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_LBUTTONDOWN:
-            if (win && win->callbacks.mouse_cb)
+            if (win && win->callbacks.mouse_cb) {
                 win->callbacks.mouse_cb((int16_t)LOWORD(lParam), (int16_t)HIWORD(lParam),
                                          1, 1, win->callbacks.userdata);
+            }
             return 0;
         case WM_LBUTTONUP:
             if (win && win->callbacks.mouse_cb)
