@@ -1,4 +1,5 @@
 #include "audio_socket.h"
+#include "../adb/binary.h"
 #include "../platform/log.h"
 #include <stdlib.h>
 #include <string.h>
@@ -49,9 +50,9 @@ bool audio_socket_read_packet(audio_socket_t *sock, uint8_t **data, uint32_t *si
         received += n;
     }
 
-    // Parse header
-    uint64_t pts = *(uint64_t *)header;
-    uint32_t packet_size = *(uint32_t *)(header + 8);
+    // Parse header (big-endian)
+    uint64_t pts = read64be(header);
+    uint32_t packet_size = read32be(header + 8);
     (void)pts; // Unused for now
 
     // Allocate buffer

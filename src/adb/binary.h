@@ -34,6 +34,11 @@ read32be(const uint8_t *buf) {
            ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
 }
 
+static inline uint64_t
+read64be(const uint8_t *buf) {
+    return ((uint64_t)read32be(buf) << 32) | read32be(buf + 4);
+}
+
 static inline uint32_t
 read32le(const uint8_t *buf) {
     return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) |

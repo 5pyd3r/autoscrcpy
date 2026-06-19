@@ -18,7 +18,7 @@ int device_msg_deserialize(const uint8_t *data, uint32_t len, struct device_msg 
                 log_error("Clipboard message too short");
                 return -1;
             }
-            msg->clipboard.sequence = *(uint64_t *)(data + 1);
+            msg->clipboard.sequence = read64be(data + 1);
             msg->clipboard.len = len - 9;
             msg->clipboard.text = malloc(msg->clipboard.len + 1);
             if (!msg->clipboard.text) {
@@ -34,7 +34,7 @@ int device_msg_deserialize(const uint8_t *data, uint32_t len, struct device_msg 
                 log_error("Ack clipboard message too short");
                 return -1;
             }
-            msg->ack_clipboard.sequence = *(uint64_t *)(data + 1);
+            msg->ack_clipboard.sequence = read64be(data + 1);
             break;
         }
         case DEVICE_MSG_TYPE_UHID_OUTPUT: {
@@ -42,8 +42,8 @@ int device_msg_deserialize(const uint8_t *data, uint32_t len, struct device_msg 
                 log_error("UHID output message too short");
                 return -1;
             }
-            msg->uhid_output.id = *(uint16_t *)(data + 1);
-            msg->uhid_output.len = *(uint16_t *)(data + 3);
+            msg->uhid_output.id = read16be(data + 1);
+            msg->uhid_output.len = read16be(data + 3);
             if (len < 5 + msg->uhid_output.len) {
                 log_error("UHID output message data too short");
                 return -1;

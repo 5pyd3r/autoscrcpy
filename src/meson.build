@@ -28,8 +28,6 @@ device_src = files(
 decode_src = files(
     'decode/video_decoder.c',
     'decode/audio_decoder.c',
-    'decode/packet_queue.c',
-    'decode/frame_buffer.c',
 )
 
 # Render sources
@@ -37,14 +35,10 @@ render_src = files(
     'render/d3d_context.c',
     'render/video_renderer.c',
     'render/shader.c',
-    'render/texture.c',
 )
 
 # Input sources
 input_src = files(
-    'input/keyboard.c',
-    'input/mouse.c',
-    'input/gamepad.c',
     'input/keycode_map.c',
     'input/input_transform.c',
 )

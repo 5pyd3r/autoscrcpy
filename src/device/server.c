@@ -78,12 +78,12 @@ static adb_connection_t *do_adb_connect(const char *host, uint16_t port) {
     {
         uint8_t pkt[48];
         memset(pkt, 0, 48);
-        *(uint32_t *)(pkt + 0)  = ADB_CNXN;
-        *(uint32_t *)(pkt + 4)  = ADB_VERSION;
-        *(uint32_t *)(pkt + 8)  = ADB_MAX_PAYLOAD;
-        *(uint32_t *)(pkt + 12) = 24; /* banner len + null */
-        *(uint32_t *)(pkt + 16) = 0;
-        *(uint32_t *)(pkt + 20) = ADB_CNXN ^ 0xffffffff;
+        write32be(pkt + 0, ADB_CNXN);
+        write32be(pkt + 4, ADB_VERSION);
+        write32be(pkt + 8, (uint32_t)ADB_MAX_PAYLOAD);
+        write32be(pkt + 12, 24); /* banner len + null */
+        write32be(pkt + 16, 0);
+        write32be(pkt + 20, ADB_CNXN ^ 0xffffffff);
         memcpy(pkt + 24, "host::features=shell_v2", 24);
         send(fd, (const char *)pkt, 48, 0);
     }
@@ -104,10 +104,10 @@ static adb_connection_t *do_adb_connect(const char *host, uint16_t port) {
             got += n;
         }
 
-        uint32_t cmd  = *(uint32_t *)(hdr + 0);
-        uint32_t arg0 = *(uint32_t *)(hdr + 4);
-        uint32_t dlen = *(uint32_t *)(hdr + 12);
-        uint32_t mag  = *(uint32_t *)(hdr + 20);
+        uint32_t cmd  = read32be(hdr + 0);
+        uint32_t arg0 = read32be(hdr + 4);
+        uint32_t dlen = read32be(hdr + 12);
+        uint32_t mag  = read32be(hdr + 20);
         if (mag != (cmd ^ 0xffffffff)) goto fail;
 
         uint8_t payload[4096];
@@ -183,8 +183,8 @@ static adb_connection_t *do_adb_connect(const char *host, uint16_t port) {
         } else if (cmd == ADB_CNXN) {
             conn->protocol_version = (int)(arg0 < (uint32_t)ADB_VERSION
                                            ? arg0 : (uint32_t)ADB_VERSION);
-            conn->max_payload = (size_t)(*(uint32_t *)(hdr + 8) < (uint32_t)ADB_MAX_PAYLOAD
-                                         ? *(uint32_t *)(hdr + 8) : (uint32_t)ADB_MAX_PAYLOAD);
+            conn->max_payload = (size_t)(read32be(hdr + 8) < (uint32_t)ADB_MAX_PAYLOAD
+                                         ? read32be(hdr + 8) : (uint32_t)ADB_MAX_PAYLOAD);
             conn->state = ADB_STATE_CONNECTED;
             if (dlen > 0) {
                 int cl = (int)dlen;
