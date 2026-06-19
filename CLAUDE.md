@@ -115,10 +115,13 @@ Win32 system libraries linked directly: d3d11, dxgi, user32, kernel32, gdi32, ws
 
 ## Git Workflow
 
-- **master** branch is the working branch
-- Feature branches: `feat/<desc>`, `fix/<desc>`, `refactor/<desc>`
-- Never commit directly to main without going through a feature branch
-- Use `git worktree` for isolated branch work when needed
+- **master** branch is the stable mainline
+- All new development on feature branches: `feat/<desc>`, `fix/<desc>`, `refactor/<desc>`
+- Merge to master only after testing and confirmation
+- Milestone tags: `v0.1.0` (video streaming working)
+
+### Current Milestone: v0.1.0
+Video streaming fully working - ADB connection, H.264 decoding, D3D11 rendering, aspect ratio correction.
 
 ## Project Status
 
