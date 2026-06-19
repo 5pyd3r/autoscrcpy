@@ -9,7 +9,6 @@ struct video_decoder {
     AVCodecParserContext *parser;
     AVFrame *frame;
     AVPacket *packet;
-    bool got_keyframe; /* Whether we've received a keyframe yet */
 };
 
 video_decoder_t *video_decoder_create(void) {
@@ -21,7 +20,6 @@ video_decoder_t *video_decoder_create(void) {
         video_decoder_destroy(decoder);
         return NULL;
     }
-    decoder->got_keyframe = false;
     return decoder;
 }
 
@@ -88,36 +86,11 @@ static bool frame_to_nv12(const AVFrame *src, video_frame_t *dst) {
     return true;
 }
 
-/* Send packet to decoder and try to extract frames */
-static bool decode_packet(video_decoder_t *decoder, const uint8_t *data, int size, video_frame_t *frame) {
-    decoder->packet->data = (uint8_t *)data;
-    decoder->packet->size = size;
-
-    int ret = avcodec_send_packet(decoder->codec_ctx, decoder->packet);
-    if (ret < 0 && ret != AVERROR(EAGAIN)) return false;
-
-    /* Extract all available frames, keep the latest one */
-    bool got_frame = false;
-    while (true) {
-        ret = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
-        if (ret < 0) break;
-
-        /* Free previous frame data if we got a newer one */
-        if (got_frame) {
-            video_frame_free(frame);
-        }
-
-        if (frame_to_nv12(decoder->frame, frame)) {
-            got_frame = true;
-        }
-    }
-
-    return got_frame;
-}
-
 bool video_decoder_decode(video_decoder_t *decoder, const uint8_t *data,
                           uint32_t size, video_frame_t *frame) {
     if (!decoder || !decoder->codec_ctx) return false;
+
+    frame->data = NULL;
 
     if (decoder->parser) {
         /* Use parser for proper NAL framing */
@@ -135,19 +108,32 @@ bool video_decoder_decode(video_decoder_t *decoder, const uint8_t *data,
             buf += consumed;
             remaining -= consumed;
 
-            /* If parser produced a complete packet, decode it */
             if (parsed_size > 0) {
-                if (decode_packet(decoder, parsed_data, parsed_size, frame)) {
-                    return true; /* Got a frame */
-                }
+                /* Send packet to decoder */
+                decoder->packet->data = parsed_data;
+                decoder->packet->size = parsed_size;
+                avcodec_send_packet(decoder->codec_ctx, decoder->packet);
             }
+        }
+
+        /* Try to receive a decoded frame */
+        if (avcodec_receive_frame(decoder->codec_ctx, decoder->frame) >= 0) {
+            return frame_to_nv12(decoder->frame, frame);
         }
 
         return false;
     }
 
     /* Fallback: raw mode without parser */
-    return decode_packet(decoder, data, (int)size, frame);
+    decoder->packet->data = (uint8_t *)data;
+    decoder->packet->size = (int)size;
+    avcodec_send_packet(decoder->codec_ctx, decoder->packet);
+
+    if (avcodec_receive_frame(decoder->codec_ctx, decoder->frame) >= 0) {
+        return frame_to_nv12(decoder->frame, frame);
+    }
+
+    return false;
 }
 
 void video_frame_free(video_frame_t *frame) {
