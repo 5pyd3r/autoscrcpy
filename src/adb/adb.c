@@ -106,11 +106,11 @@ adb_connection_t *adb_connect(const char *host, uint16_t port) {
             received += n;
         }
 
-        uint32_t cmd = read32be(hdr_buf + 0);
-        uint32_t arg0 = read32be(hdr_buf + 4);
-        uint32_t arg1 = read32be(hdr_buf + 8);
-        uint32_t dlen = read32be(hdr_buf + 12);
-        uint32_t magic = read32be(hdr_buf + 20);
+        uint32_t cmd = read32le(hdr_buf + 0);
+        uint32_t arg0 = read32le(hdr_buf + 4);
+        uint32_t arg1 = read32le(hdr_buf + 8);
+        uint32_t dlen = read32le(hdr_buf + 12);
+        uint32_t magic = read32le(hdr_buf + 20);
 
         if (magic != (cmd ^ 0xffffffff)) goto handshake_fail;
 
@@ -130,9 +130,9 @@ adb_connection_t *adb_connect(const char *host, uint16_t port) {
             /* Reply STLS */
             uint8_t stls[24];
             memset(stls, 0, 24);
-            write32be(stls + 0, ADB_STLS);
-            write32be(stls + 4, 0x01000000); /* STLS version */
-            write32be(stls + 20, ADB_STLS ^ 0xffffffff);
+            write32le(stls + 0, ADB_STLS);
+            write32le(stls + 4, 0x01000000); /* STLS version */
+            write32le(stls + 20, ADB_STLS ^ 0xffffffff);
             send(conn->fd, (const char *)stls, 24, 0);
 
             /* TLS handshake */
