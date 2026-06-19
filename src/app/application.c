@@ -116,7 +116,10 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
         application_destroy(app);
         return false;
     }
-    audio_player_init(app->audio_player, 48000, 2);
+    if (!audio_player_init(app->audio_player, 48000, 2)) {
+        log_warn("Audio player init failed (WASAPI unavailable)");
+        /* Non-fatal: audio just won't work */
+    }
 
     app->stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
     app->video_sock.fd = INVALID_SOCKFD;

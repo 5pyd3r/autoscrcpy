@@ -3,6 +3,13 @@
 #include <string.h>
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    /* Handle WM_NCCREATE to set GWLP_USERDATA before any other messages */
+    if (msg == WM_NCCREATE) {
+        CREATESTRUCT *cs = (CREATESTRUCT *)lParam;
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+
     window_t *win = (window_t *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 
     switch (msg) {
@@ -98,7 +105,7 @@ bool window_init(window_t *win, HINSTANCE hInstance, const char *title,
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top,
-        NULL, NULL, hInstance, NULL);
+        NULL, NULL, hInstance, win);
 
     if (!win->hwnd) {
         log_error("Failed to create window");

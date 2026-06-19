@@ -246,68 +246,6 @@ static int create_socketpair(SOCKET_T fds[2]) {
     return 0;
 }
 
-/* Forward relay context: each forwarded connection has its own TLS to adbd */
-typedef struct {
-    adb_connection_t *adb_conn;   /* Independent TLS connection to adbd */
-    adb_channel_t    *chan;       /* ADB channel for localabstract:scrcpy */
-    SOCKET_T          local_fd;   /* Local socket (client side) */
-    volatile int      running;
-} fwd_relay_t;
-
-/* Relay thread state — each thread has its own persistent buffer */
-typedef struct {
-    uint8_t *buf;       /* accumulation buffer */
-    int      used;      /* bytes currently in buf */
-    int      hdr_done;  /* 1 if header parsed */
-    int      expect;    /* expected payload size (from header) */
-} relay_buf_t;
-
-/* Try to read one complete ADB message from TLS into the relay buffer.
- * Maintains state across calls — partial data is preserved.
- * Returns: 1 = complete message ready, 0 = need more data, -1 = error. */
-static int relay_try_recv(void *tls_ctx, relay_buf_t *rb) {
-    int buf_size = ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD;
-    int n = tls_recv(tls_ctx, rb->buf + rb->used, buf_size - rb->used);
-    if (n < 0) return -1;
-    if (n == 0) return 0; /* WANT_READ or timeout */
-    rb->used += n;
-
-    /* Parse header if not done yet */
-    if (!rb->hdr_done && rb->used >= ADB_MSG_HEADER_SIZE) {
-        adb_message_t *hdr = (adb_message_t *)rb->buf;
-        if (hdr->magic != (hdr->command ^ 0xFFFFFFFF)) return -1;
-        rb->hdr_done = 1;
-        rb->expect = (int)hdr->data_length;
-    }
-    if (!rb->hdr_done) return 0;
-    if (rb->used < ADB_MSG_HEADER_SIZE + rb->expect) return 0;
-    return 1; /* complete message */
-}
-
-/* Extract the complete message from relay buffer, reset state for next message */
-static void relay_extract_msg(relay_buf_t *rb, adb_message_t *out_hdr,
-                              uint8_t *out_pl, int max_pl) {
-    memcpy(out_hdr, rb->buf, ADB_MSG_HEADER_SIZE);
-    if (rb->expect > 0 && out_pl) {
-        int cl = rb->expect > max_pl ? max_pl : rb->expect;
-        memcpy(out_pl, rb->buf + ADB_MSG_HEADER_SIZE, cl);
-    }
-    /* Shift remaining data to front */
-    int msg_total = ADB_MSG_HEADER_SIZE + rb->expect;
-    int remaining = rb->used - msg_total;
-    if (remaining > 0) memmove(rb->buf, rb->buf + msg_total, remaining);
-    rb->used = remaining;
-    rb->hdr_done = 0;
-    rb->expect = 0;
-}
-
-/* OKAY ACK queue — decouples read from write to avoid TLS deadlock */
-#define OKAY_QUEUE_SIZE 64
-typedef struct {
-    uint32_t local_id;
-    uint32_t remote_id;
-} okay_entry_t;
-
 /* ADB I/O thread: single-threaded event loop for reading and writing.
  * Uses non-blocking TLS. ssl_write WANT_READ is handled by skipping
  * the write and retrying on the next iteration (after ssl_read drains
@@ -318,34 +256,6 @@ typedef struct {
     SOCKET_T          video_write_fd; /* write end of socketpair */
     volatile int      running;
 } adb_reader_t;
-
-/* Video data buffer for accumulating WRTE payloads during setup phase */
-typedef struct {
-    uint8_t *data;
-    uint32_t used;
-    uint32_t capacity;
-} video_buf_t;
-
-static void video_buf_init(video_buf_t *vb) {
-    vb->capacity = 256 * 1024; /* 256KB initial */
-    vb->data = malloc(vb->capacity);
-    vb->used = 0;
-}
-
-static void video_buf_append(video_buf_t *vb, const uint8_t *src, uint32_t len) {
-    if (vb->used + len > vb->capacity) {
-        vb->capacity = (vb->used + len) * 2;
-        vb->data = realloc(vb->data, vb->capacity);
-    }
-    memcpy(vb->data + vb->used, src, len);
-    vb->used += len;
-}
-
-static void video_buf_free(video_buf_t *vb) {
-    free(vb->data);
-    vb->data = NULL;
-    vb->used = 0;
-}
 
 static DWORD WINAPI adb_reader_thread(LPVOID arg) {
     adb_reader_t *r = (adb_reader_t *)arg;
@@ -416,104 +326,6 @@ static DWORD WINAPI adb_reader_thread(LPVOID arg) {
     free(pl);
     r->running = 0;
     return 0;
-}
-
-/* Send OKAY ack for a WRTE message using adb_send_msg_conn (handles TLS retries). */
-static void relay_send_okay(fwd_relay_t *r) {
-    adb_send_msg_conn(r->adb_conn, ADB_OKAY,
-                      r->chan->local_id, r->chan->remote_id, NULL, 0, 1);
-}
-
-/* Relay thread: bidirectional data relay between ADB channel and local socket.
- * Device→Local: WRTE from adbd → extract payload → send to local → OKAY ack
- * Local→Device: recv from local → WRTE to adbd
- * Non-blocking TLS, no Sleep in hot path. */
-static DWORD WINAPI fwd_relay_thread(LPVOID arg) {
-    fwd_relay_t *r = (fwd_relay_t *)arg;
-    uint8_t *pl = malloc(ADB_MAX_PAYLOAD);
-    relay_buf_t rb;
-    rb.buf = malloc(ADB_MSG_HEADER_SIZE + ADB_MAX_PAYLOAD);
-    rb.used = 0; rb.hdr_done = 0; rb.expect = 0;
-    if (!pl || !rb.buf) { free(pl); free(rb.buf); return 0; }
-    int rcnt = 0, idle = 0;
-
-    /* Set local socket non-blocking for bidirectional relay */
-    SET_NONBLOCK(r->local_fd);
-
-    while (r->running) {
-        int ret = relay_try_recv(r->adb_conn->tls_ctx, &rb);
-        if (ret < 0) { fprintf(stderr, "R:ERR\n"); break; }
-        if (ret == 0) {
-            idle++;
-            if (idle == 10000 || idle % 100000 == 0)
-                fprintf(stderr, "R:idle %d\n", idle);
-            /* No ADB data — check local socket for client→device data */
-            uint8_t buf[16384];
-            int n = recv(r->local_fd, (char *)buf, sizeof(buf), 0);
-            if (n > 0) {
-                /* Client data → WRTE to adbd */
-                adb_send_msg_tls(r->adb_conn->tls_ctx, r->adb_conn->fd,
-                                 ADB_WRTE, r->chan->local_id, r->chan->remote_id,
-                                 buf, (uint32_t)n, 1);
-            } else if (n == 0) {
-                break; /* client disconnected */
-            }
-            /* n < 0: WOULDBLOCK — no data, continue */
-            SwitchToThread();
-            continue;
-        }
-
-        /* ADB message available */
-        idle = 0;
-        adb_message_t msg;
-        relay_extract_msg(&rb, &msg, pl, ADB_MAX_PAYLOAD);
-
-        if (msg.command == ADB_WRTE && msg.arg0 == r->chan->remote_id) {
-            rcnt++;
-            if (rcnt <= 5 || rcnt % 100 == 0)
-                fprintf(stderr, "R:%d %uB\n", rcnt, msg.data_length);
-            if (msg.data_length > 0) {
-                send(r->local_fd, (const char *)pl, msg.data_length, 0);
-            }
-            relay_send_okay(r);
-        } else if (msg.command == ADB_CLSE) {
-            break;
-        } else if (msg.command == ADB_OKAY) {
-            for (int i = 0; i < r->adb_conn->channel_count; i++) {
-                if (r->adb_conn->channels[i].local_id == msg.arg1) {
-                    r->adb_conn->channels[i].remote_id = msg.arg0;
-                    r->adb_conn->channels[i].state = CHAN_OPEN;
-                    break;
-                }
-            }
-        }
-    }
-
-    free(pl);
-    free(rb.buf);
-    r->running = 0;
-    return 0;
-}
-
-/* Create a local TCP listener */
-static SOCKET_T create_listener(uint16_t port) {
-    SOCKET_T fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == INVALID_SOCKFD) return INVALID_SOCKFD;
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        CLOSESOCKET(fd); return INVALID_SOCKFD;
-    }
-    if (listen(fd, 4) < 0) {
-        CLOSESOCKET(fd); return INVALID_SOCKFD;
-    }
-    log_info("Listening on 127.0.0.1:%u", port);
-    return fd;
 }
 
 static void server_shell_output_cb(const uint8_t *data, uint32_t len, void *arg) {
