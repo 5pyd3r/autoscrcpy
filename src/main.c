@@ -9,8 +9,8 @@ int main(int argc, char *argv[]) {
     /* Initialize logging */
     log_init(LOG_LEVEL_INFO);
 
-    /* Suppress FFmpeg verbose logging (only show errors) */
-    av_log_set_level(AV_LOG_ERROR);
+    /* Suppress FFmpeg logging completely (H.264 decoder produces noisy warnings) */
+    av_log_set_level(AV_LOG_QUIET);
 
     /* Parse command line options */
     struct scrcpy_options options;
