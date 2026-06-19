@@ -32,7 +32,7 @@ bool control_socket_accept(control_socket_t *sock, SOCKET_T listen_fd) {
 /* Send control message to scrcpy-server.
  * scrcpy protocol: raw bytes, no size header. Type(1) + data directly. */
 bool control_socket_send_msg(control_socket_t *sock, const uint8_t *data, uint32_t size) {
-    if (sock->fd == INVALID_SOCKFD) return false; /* Control not connected */
+    if (sock->fd == INVALID_SOCKFD) return false;
     size_t sent = 0;
     while (sent < size) {
         int n = send(sock->fd, (const char *)(data + sent), size - sent, MSG_NOSIGNAL);

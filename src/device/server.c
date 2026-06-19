@@ -253,9 +253,39 @@ static int create_socketpair(SOCKET_T fds[2]) {
 typedef struct {
     adb_connection_t *conn;
     adb_channel_t    *video_chan;
-    SOCKET_T          video_write_fd; /* write end of socketpair */
+    adb_channel_t    *ctrl_chan;      /* control channel (may be NULL) */
+    SOCKET_T          video_write_fd; /* write end of video socketpair */
+    SOCKET_T          ctrl_write_fd;  /* write end of control socketpair (app writes here) */
+    CRITICAL_SECTION  send_lock;      /* Protects TLS writes */
     volatile int      running;
 } adb_reader_t;
+
+/* Control sender thread: reads from control socketpair, sends to device via ADB */
+static DWORD WINAPI ctrl_sender_thread(LPVOID arg) {
+    adb_reader_t *r = (adb_reader_t *)arg;
+    uint8_t buf[1024];
+
+    while (r->running) {
+        int n = recv(r->ctrl_write_fd, (char *)buf, sizeof(buf), 0);
+        if (n <= 0) {
+            if (n < 0 && SOCKET_ERRNO == WOULDBLOCK_ERR) {
+                Sleep(1);
+                continue;
+            }
+            break;
+        }
+
+        if (r->ctrl_chan && r->ctrl_chan->state == CHAN_OPEN && r->ctrl_chan->remote_id != 0) {
+            EnterCriticalSection(&r->send_lock);
+            adb_send_msg_conn(r->conn, ADB_WRTE,
+                              r->ctrl_chan->local_id, r->ctrl_chan->remote_id,
+                              buf, (uint32_t)n, 1);
+            LeaveCriticalSection(&r->send_lock);
+        }
+    }
+
+    return 0;
+}
 
 static DWORD WINAPI adb_reader_thread(LPVOID arg) {
     adb_reader_t *r = (adb_reader_t *)arg;
@@ -269,13 +299,22 @@ static DWORD WINAPI adb_reader_thread(LPVOID arg) {
         if (ret <= 0) break;
 
         if (msg.command == ADB_WRTE) {
+            /* Identify which channel this WRTE belongs to */
             if (r->video_chan->remote_id == 0) {
                 r->video_chan->remote_id = msg.arg0;
             }
+
+            /* Send OKAY first for flow control (with lock) */
+            EnterCriticalSection(&r->send_lock);
             adb_send_msg_conn(r->conn, ADB_OKAY,
                               msg.arg1, msg.arg0, NULL, 0, 1);
+            LeaveCriticalSection(&r->send_lock);
+
+            /* Dispatch data to appropriate socketpair */
             if (msg.arg0 == r->video_chan->remote_id && msg.data_length > 0) {
                 send(r->video_write_fd, (const char *)pl, msg.data_length, 0);
+            } else if (r->ctrl_chan && msg.arg0 == r->ctrl_chan->remote_id && msg.data_length > 0) {
+                send(r->ctrl_write_fd, (const char *)pl, msg.data_length, 0);
             }
         } else if (msg.command == ADB_OKAY) {
             /* Handle OKAY — update channel state WITHOUT sending duplicate OKAY.
@@ -293,6 +332,7 @@ static DWORD WINAPI adb_reader_thread(LPVOID arg) {
             if (local_id == r->video_chan->local_id) {
                 log_info("Video channel OKAY: remote_id=%u", remote_id);
             }
+            /* Control channel OKAY is expected for every message — no need to log */
         } else {
             session_handle_message(r->conn, &msg, pl);
         }
@@ -492,7 +532,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  "video_bit_rate=%u max_size=%u",
                  srv->config.video ? "true" : "false",
                  "false", /* audio off */
-                 "false", /* control off */
+                 srv->config.control ? "true" : "false",
                  srv->config.video_bit_rate,
                  srv->config.max_size);
         log_info("Starting scrcpy-server (bitrate=%u, max_size=%u)...",
@@ -513,19 +553,23 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         }
     }
 
-    /* Open ALL channels that the server expects.
+    /* Open channels that the server expects.
      * scrcpy-server with tunnel_forward=true does blocking accept() for each
-     * channel in order: video → audio → control. We must open all of them
-     * or the server blocks on accept() and never sends data. */
+     * channel in order: video → control (audio disabled). */
     adb_channel_t *video_chan = session_open_channel(conn, "localabstract:scrcpy");
     if (!video_chan) {
         log_error("Failed to open video channel");
         return false;
     }
 
-    adb_channel_t *audio_chan = NULL; /* audio disabled */
-
-    adb_channel_t *ctrl_chan = NULL; /* control disabled */
+    adb_channel_t *ctrl_chan = NULL;
+    if (srv->config.control) {
+        ctrl_chan = session_open_channel(conn, "localabstract:scrcpy");
+        if (!ctrl_chan) {
+            log_error("Failed to open control channel");
+            return false;
+        }
+    }
 
     /* Create socketpair for video data relay */
     SOCKET_T sp[2];
@@ -535,18 +579,34 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     }
     video_sock->fd = sp[0];
 
-    /* Start reader thread — it handles ALL ADB messages:
-     * - OKAY for OPEN (sets channel state)
-     * - WRTE for video (dispatches to socketpair)
-     * - OKAY for WRTE (flow control)
-     * - Shell/control messages */
+    /* Create socketpair for control data relay */
+    SOCKET_T ctrl_sp[2] = {INVALID_SOCKFD, INVALID_SOCKFD};
+    if (ctrl_chan) {
+        if (create_socketpair(ctrl_sp) < 0) {
+            log_error("Failed to create control socketpair");
+            return false;
+        }
+        control_sock->fd = ctrl_sp[0];
+    }
+
+    /* Start reader thread — it handles ALL ADB messages */
     static adb_reader_t reader;
     reader.conn = conn;
     reader.video_chan = video_chan;
+    reader.ctrl_chan = ctrl_chan;
     reader.video_write_fd = sp[1];
+    reader.ctrl_write_fd = ctrl_sp[1];
+    InitializeCriticalSection(&reader.send_lock);
     reader.running = 1;
     srv->reader_thread = CreateThread(NULL, 0, adb_reader_thread, &reader, 0, NULL);
     log_info("ADB reader thread started");
+
+    /* Start control sender thread (reads from socketpair, sends to device) */
+    HANDLE ctrl_sender = NULL;
+    if (ctrl_chan) {
+        ctrl_sender = CreateThread(NULL, 0, ctrl_sender_thread, &reader, 0, NULL);
+        log_info("Control sender thread started");
+    }
 
     /* Wait for video channel to open (reader thread processes OKAY) */
     for (int i = 0; i < 300; i++) {

@@ -250,20 +250,88 @@ void application_destroy(application_t *app) {
     adb_destroy();
 }
 
-static void on_key_event(uint32_t vk, bool down, void *userdata) {
-    application_t *app = (application_t *)userdata;
-    if (!app->options.control) return;
-    uint32_t kc = vk_to_android_keycode(vk);
-    if (kc == 0) return;
+static void send_keycode(application_t *app, uint32_t kc, bool down) {
     uint8_t buf[64];
     uint32_t args[4] = {down ? 0 : 1, kc, 0, get_android_metastate()};
     uint32_t len = control_msg_serialize(CONTROL_MSG_TYPE_INJECT_KEYCODE, args, buf, sizeof(buf));
     if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
 }
 
+static void send_display_power(application_t *app, bool on) {
+    uint8_t buf[64];
+    uint32_t len = control_msg_serialize(CONTROL_MSG_TYPE_SET_DISPLAY_POWER, &on, buf, sizeof(buf));
+    if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
+}
+
+static void on_key_event(uint32_t vk, bool down, void *userdata) {
+    application_t *app = (application_t *)userdata;
+    if (!app->options.control) return;
+
+    bool alt = GetKeyState(VK_MENU) & 0x8000;
+    bool shift = GetKeyState(VK_SHIFT) & 0x8000;
+
+    /* Alt + key shortcuts (scrcpy compatible) */
+    if (alt && down) {
+        switch (vk) {
+            case 'P': /* Alt+P: Power button */
+                send_keycode(app, 26, true);
+                send_keycode(app, 26, false);
+                log_info("Alt+P: Power");
+                return;
+            case 'O': /* Alt+O: Display on, Alt+Shift+O: Display off */
+                send_display_power(app, !shift);
+                log_info("Alt+%sO: Display %s", shift ? "Shift+" : "", shift ? "off" : "on");
+                return;
+            case VK_UP: /* Alt+Up: Volume up */
+                send_keycode(app, 24, true);
+                send_keycode(app, 24, false);
+                log_info("Alt+Up: Volume up");
+                return;
+            case VK_DOWN: /* Alt+Down: Volume down */
+                send_keycode(app, 25, true);
+                send_keycode(app, 25, false);
+                log_info("Alt+Down: Volume down");
+                return;
+            case 'M': /* Alt+M: Menu */
+                send_keycode(app, 82, true);
+                send_keycode(app, 82, false);
+                log_info("Alt+M: Menu");
+                return;
+            case 'A': /* Alt+A: App switch */
+                send_keycode(app, 187, true);
+                send_keycode(app, 187, false);
+                log_info("Alt+A: App switch");
+                return;
+            case VK_BACK: /* Alt+Backspace: Back or screen on */
+                {
+                    uint8_t buf[64];
+                    uint32_t action = 0; /* DOWN */
+                    uint32_t len = control_msg_serialize(CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON, &action, buf, sizeof(buf));
+                    if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
+                    action = 1; /* UP */
+                    len = control_msg_serialize(CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON, &action, buf, sizeof(buf));
+                    if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
+                    log_info("Alt+Backspace: Back or screen on");
+                }
+                return;
+        }
+    }
+
+    /* Regular key injection (no Alt held) */
+    if (!alt) {
+        uint32_t kc = vk_to_android_keycode(vk);
+        if (kc == 0) return;
+        send_keycode(app, kc, down);
+    }
+}
+
 static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons, uint32_t action, void *userdata) {
     application_t *app = (application_t *)userdata;
     if (!app->options.control || !app->device_width || !app->device_height) return;
+
+    /* Only send events when a button is pressed (click/drag).
+     * Pure mouse movement without button pressed is not sent to device. */
+    if (action == 2 && buttons == 0) return;
 
     int32_t dx, dy;
     input_transform_coords(x, y, &dx, &dy, app->window.width, app->window.height,
@@ -272,27 +340,27 @@ static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons, uint32_t acti
     /* Map window action to Android action: DOWN=0, UP=1, MOVE=2 */
     uint32_t android_action = (action == 1) ? 0 : (action == 0) ? 1 : 2;
 
-    /* Determine which button caused the event (0 for move) */
+    /* Determine which button caused the event */
     uint32_t action_button;
-    if (action == 2) {
-        action_button = 0; /* Move events have no specific button */
-    } else if (buttons & 1) {
-        action_button = 1; /* Left button → BUTTON_PRIMARY */
+    if (buttons & 1) {
+        action_button = 1; /* Left button */
     } else if (buttons & 2) {
-        action_button = 2; /* Right button → BUTTON_SECONDARY */
+        action_button = 2; /* Right button */
     } else {
-        action_button = 1; /* Default to primary */
+        action_button = 1;
     }
 
-    /* Pressure: full for down, none for up/move */
-    uint16_t pressure = (action == 1) ? 0xFFFF : 0;
+    /* Pressure: full when button held, none for UP */
+    uint16_t pressure = (action == 0) ? 0 : 0xFFFF;
+    /* Buttons state: UP event → no buttons pressed */
+    uint32_t buttons_state = (action == 0) ? 0 : action_button;
 
     uint8_t buf[64];
     uint32_t args[10] = {
         android_action, 0xFFFFFFFF, 0xFFFFFFFF,
         (uint32_t)dx, (uint32_t)dy,
         (uint32_t)app->device_width, (uint32_t)app->device_height,
-        pressure, action_button, action_button
+        pressure, action_button, buttons_state
     };
     uint32_t len = control_msg_serialize(CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT, args, buf, sizeof(buf));
     if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
