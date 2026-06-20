@@ -253,10 +253,12 @@ static int create_socketpair(SOCKET_T fds[2]) {
 typedef struct {
     adb_connection_t *conn;
     adb_channel_t    *video_chan;
-    adb_channel_t    *ctrl_chan;      /* control channel (may be NULL) */
-    SOCKET_T          video_write_fd; /* write end of video socketpair */
-    SOCKET_T          ctrl_write_fd;  /* write end of control socketpair (app writes here) */
-    CRITICAL_SECTION  send_lock;      /* Protects TLS writes */
+    adb_channel_t    *audio_chan;      /* audio channel (may be NULL) */
+    adb_channel_t    *ctrl_chan;       /* control channel (may be NULL) */
+    SOCKET_T          video_write_fd;  /* write end of video socketpair */
+    SOCKET_T          audio_write_fd;  /* write end of audio socketpair */
+    SOCKET_T          ctrl_write_fd;   /* write end of control socketpair (app writes here) */
+    CRITICAL_SECTION  send_lock;       /* Protects TLS writes */
     volatile int      running;
 } adb_reader_t;
 
@@ -300,8 +302,11 @@ static DWORD WINAPI adb_reader_thread(LPVOID arg) {
 
         if (msg.command == ADB_WRTE) {
             /* Identify which channel this WRTE belongs to */
-            if (r->video_chan->remote_id == 0) {
+            if (r->video_chan && r->video_chan->remote_id == 0) {
                 r->video_chan->remote_id = msg.arg0;
+            }
+            if (r->audio_chan && r->audio_chan->remote_id == 0) {
+                r->audio_chan->remote_id = msg.arg0;
             }
 
             /* Send OKAY first for flow control (with lock) */
@@ -311,8 +316,10 @@ static DWORD WINAPI adb_reader_thread(LPVOID arg) {
             LeaveCriticalSection(&r->send_lock);
 
             /* Dispatch data to appropriate socketpair */
-            if (msg.arg0 == r->video_chan->remote_id && msg.data_length > 0) {
+            if (r->video_chan && msg.arg0 == r->video_chan->remote_id && msg.data_length > 0) {
                 send(r->video_write_fd, (const char *)pl, msg.data_length, 0);
+            } else if (r->audio_chan && msg.arg0 == r->audio_chan->remote_id && msg.data_length > 0) {
+                send(r->audio_write_fd, (const char *)pl, msg.data_length, 0);
             } else if (r->ctrl_chan && msg.arg0 == r->ctrl_chan->remote_id && msg.data_length > 0) {
                 send(r->ctrl_write_fd, (const char *)pl, msg.data_length, 0);
             }
@@ -329,8 +336,10 @@ static DWORD WINAPI adb_reader_thread(LPVOID arg) {
                     break;
                 }
             }
-            if (local_id == r->video_chan->local_id) {
+            if (r->video_chan && local_id == r->video_chan->local_id) {
                 log_info("Video channel OKAY: remote_id=%u", remote_id);
+            } else if (r->audio_chan && local_id == r->audio_chan->local_id) {
+                log_info("Audio channel OKAY: remote_id=%u", remote_id);
             }
             /* Control channel OKAY is expected for every message — no need to log */
         } else {
@@ -529,11 +538,13 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  "app_process / com.genymobile.scrcpy.Server 3.3.2 "
                  "tunnel_forward=true "
                  "video=%s audio=%s control=%s "
-                 "video_bit_rate=%u max_size=%u",
+                 "video_bit_rate=%u audio_bit_rate=%u max_size=%u "
+                 "audio_codec=opus",
                  srv->config.video ? "true" : "false",
-                 "false", /* audio off */
+                 srv->config.audio ? "true" : "false",
                  srv->config.control ? "true" : "false",
                  srv->config.video_bit_rate,
+                 srv->config.audio_bit_rate,
                  srv->config.max_size);
         log_info("Starting scrcpy-server (bitrate=%u, max_size=%u)...",
                  srv->config.video_bit_rate, srv->config.max_size);
@@ -555,11 +566,22 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
 
     /* Open channels that the server expects.
      * scrcpy-server with tunnel_forward=true does blocking accept() for each
-     * channel in order: video → control (audio disabled). */
+     * channel in order: video → audio (if enabled) → control. */
     adb_channel_t *video_chan = session_open_channel(conn, "localabstract:scrcpy");
     if (!video_chan) {
         log_error("Failed to open video channel");
         return false;
+    }
+
+    /* Open audio channel if audio is enabled.
+     * scrcpy-server tunnel_forward order: video → audio → control */
+    adb_channel_t *audio_chan = NULL;
+    if (srv->config.audio) {
+        audio_chan = session_open_channel(conn, "localabstract:scrcpy");
+        if (!audio_chan) {
+            log_error("Failed to open audio channel");
+            return false;
+        }
     }
 
     adb_channel_t *ctrl_chan = NULL;
@@ -579,6 +601,16 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     }
     video_sock->fd = sp[0];
 
+    /* Create socketpair for audio data relay */
+    SOCKET_T audio_sp[2] = {INVALID_SOCKFD, INVALID_SOCKFD};
+    if (audio_chan) {
+        if (create_socketpair(audio_sp) < 0) {
+            log_error("Failed to create audio socketpair");
+            return false;
+        }
+        audio_sock->fd = audio_sp[0];
+    }
+
     /* Create socketpair for control data relay */
     SOCKET_T ctrl_sp[2] = {INVALID_SOCKFD, INVALID_SOCKFD};
     if (ctrl_chan) {
@@ -593,8 +625,10 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     static adb_reader_t reader;
     reader.conn = conn;
     reader.video_chan = video_chan;
+    reader.audio_chan = audio_chan;
     reader.ctrl_chan = ctrl_chan;
     reader.video_write_fd = sp[1];
+    reader.audio_write_fd = audio_sp[1];
     reader.ctrl_write_fd = ctrl_sp[1];
     InitializeCriticalSection(&reader.send_lock);
     reader.running = 1;
@@ -618,6 +652,19 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         return false;
     }
     log_info("Video channel open (remote_id=%u)", video_chan->remote_id);
+
+    /* Wait for audio channel */
+    if (audio_chan) {
+        for (int i = 0; i < 300; i++) {
+            if (audio_chan->state == CHAN_OPEN) break;
+            Sleep(100);
+        }
+        if (audio_chan->state == CHAN_OPEN) {
+            log_info("Audio channel open (remote_id=%u)", audio_chan->remote_id);
+        } else {
+            log_warn("Audio channel did not open");
+        }
+    }
 
     /* Wait for control channel */
     if (ctrl_chan) {
