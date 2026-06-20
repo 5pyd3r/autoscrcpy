@@ -63,6 +63,12 @@ audio_src = files(
     'audio/regulator.c',
 )
 
+# Pipeline sources
+pipeline_src = files(
+    'pipeline/video_pipeline.c',
+    'pipeline/audio_pipeline.c',
+)
+
 # App sources
 app_src = files(
     'app/application.c',
@@ -83,6 +89,7 @@ executable('autoscrcpy',
     control_src,
     record_src,
     audio_src,
+    pipeline_src,
     app_src,
     dependencies: [libavcodec_dep, libavformat_dep, libavutil_dep, libswscale_dep, libswresample_dep, mbedtls_dep] + winlibs,
     install: true,

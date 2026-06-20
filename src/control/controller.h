@@ -1,39 +1,30 @@
 #ifndef CONTROLLER_H
 #define CONTROLLER_H
 
+#include "../device/control_socket.h"
+#include "../app/window.h"
 #include <stdbool.h>
 #include <stdint.h>
-#include "../platform/platform.h"
-#include "../platform/thread.h"
-#include "control_msg.h"
-
-#define CONTROLLER_QUEUE_SIZE 64
 
 typedef struct {
-    uint8_t data[CONTROL_MSG_MAX_SIZE];
-    uint32_t size;
-} controller_msg_t;
-
-typedef struct {
-    SOCKET_T control_socket;
-    thread_t thread;
-    mutex_t mutex;
-    cond_t cond;
-    bool stopped;
-
-    controller_msg_t queue[CONTROLLER_QUEUE_SIZE];
-    int queue_head;
-    int queue_tail;
-    int queue_count;
+    control_socket_t *sock;
+    uint32_t device_width;
+    uint32_t device_height;
+    uint32_t window_width;
+    uint32_t window_height;
+    bool enabled;
 } controller_t;
 
-bool controller_init(controller_t *ctrl, SOCKET_T control_socket);
-bool controller_start(controller_t *ctrl);
-void controller_stop(controller_t *ctrl);
-void controller_join(controller_t *ctrl);
-void controller_destroy(controller_t *ctrl);
+bool controller_init(controller_t *ctrl, control_socket_t *sock);
+void controller_set_device_size(controller_t *ctrl, uint32_t w, uint32_t h);
+void controller_set_window_size(controller_t *ctrl, uint32_t w, uint32_t h);
+void controller_set_enabled(controller_t *ctrl, bool enabled);
 
-/* Push a serialized control message (thread-safe, non-blocking) */
-bool controller_push_msg(controller_t *ctrl, const uint8_t *data, uint32_t size);
+/* Callback handlers — call these from window callbacks */
+void controller_on_key_event(controller_t *ctrl, uint32_t vk, bool down);
+void controller_on_mouse_event(controller_t *ctrl, int32_t x, int32_t y,
+                               uint32_t buttons, uint32_t action);
+void controller_on_wheel_event(controller_t *ctrl, int32_t x, int32_t y,
+                               int32_t delta);
 
 #endif /* CONTROLLER_H */
