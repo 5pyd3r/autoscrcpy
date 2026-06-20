@@ -16,7 +16,7 @@ AutoScrcpy 当前仅支持命令行参数配置。本设计新增 INI 配置文�
 
 ```
 src/app/
-├── cli.c          # 命令令行解析（已有）
+├── cli.c          # 命令行解析（已有）
 ├── cli.h
 ├── config.c       # INI 配置文件解析（新增）
 ├── config.h
@@ -123,7 +123,7 @@ level = info
 
 ## Options Structure Extension
 
-`scrcpy_options` 结构体新增 3 个字段：
+`scrcpy_options` 结构体新增 4 个字段：
 
 ```c
 struct scrcpy_options {
