@@ -139,9 +139,47 @@ adb_connection_t *adb_connect(const char *host, uint16_t port) {
             }
             log_info("TLS handshake successful");
 
-            /* Send CNXN over TLS */
-            session_send_cnxn(conn);
-            /* Continue loop to read device's CNXN over TLS */
+            /* Per reference: after TLS handshake, device speaks first.
+             * Wait for device AUTH/CNXN before sending our CNXN. */
+            log_info("Waiting for device to speak first after TLS...");
+            for (int t2 = 0; t2 < 50 && conn->state != ADB_STATE_CONNECTED; t2++) {
+                adb_message_t rmsg;
+                uint8_t rpl[4096];
+                memset(&rmsg, 0, sizeof(rmsg));
+                int ret2 = adb_recv_msg_conn(conn, &rmsg, rpl, sizeof(rpl), 1);
+                if (ret2 < 0) { platform_sleep_ms(100); continue; }
+
+                log_info("TLS post-handshake: cmd=0x%08x arg0=0x%08x dlen=%u",
+                         rmsg.command, rmsg.arg0, rmsg.data_length);
+
+                if (rmsg.command == ADB_AUTH && rmsg.arg0 == ADB_AUTH_TYPE_TOKEN) {
+                    /* Device sent AUTH token — sign it */
+                    uint8_t sig2[512]; int sl2 = 0;
+                    if (crypto_sign_token(rpl, rmsg.data_length, sig2, &sl2) == 0) {
+                        adb_send_msg_conn(conn, ADB_AUTH, ADB_AUTH_TYPE_RSAKEY, 0,
+                                          sig2, (uint32_t)sl2, 1);
+                    }
+                } else if (rmsg.command == ADB_STLS) {
+                    /* adbd re-sent STLS — reply and continue */
+                    adb_send_msg_conn(conn, ADB_STLS, ADB_STLS_VERSION, 0, NULL, 0, 0);
+                } else if (rmsg.command == ADB_CNXN) {
+                    /* Device sent CNXN — parse banner. Do NOT send CNXN reply. */
+                    conn->protocol_version = (int)(rmsg.arg0 < (uint32_t)ADB_VERSION
+                                                   ? rmsg.arg0 : (uint32_t)ADB_VERSION);
+                    conn->max_payload = (size_t)(rmsg.arg1 < (uint32_t)ADB_MAX_PAYLOAD
+                                                 ? rmsg.arg1 : (uint32_t)ADB_MAX_PAYLOAD);
+                    if (rmsg.data_length > 0) {
+                        int cl = (int)rmsg.data_length;
+                        if (cl >= BANNER_MAX) cl = BANNER_MAX - 1;
+                        memcpy(conn->banner, rpl, cl);
+                        conn->banner[cl] = '\0';
+                    }
+                    conn->state = ADB_STATE_CONNECTED;
+                    log_info("ADB connected (TLS): %s", conn->banner);
+                }
+            }
+            if (conn->state != ADB_STATE_CONNECTED) goto handshake_fail;
+            break;
         } else if (cmd == ADB_AUTH) {
             if (arg0 == ADB_AUTH_TYPE_TOKEN) {
                 uint8_t sig[512];

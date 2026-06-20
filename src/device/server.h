@@ -32,6 +32,7 @@ typedef struct server {
     HANDLE reader_thread;    /* ADB reader thread handle */
     volatile int *reader_running; /* pointer to reader's running flag */
     volatile bool running;
+    void *reader;              /* adb_reader_t* allocated on heap */
 } server_t;
 
 bool server_init(server_t *srv, const struct server_config *config);

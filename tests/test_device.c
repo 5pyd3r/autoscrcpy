@@ -8,6 +8,7 @@
 #include "../src/decode/video_decoder.h"
 
 static char host[256] = {0};
+static char serial_str[256] = {0};
 static uint16_t port = 5555;
 static int passed = 0;
 static int failed = 0;
@@ -94,7 +95,7 @@ static bool g_server_started = false;
 
 static bool start_test_server(void) {
     struct server_config cfg = {
-        .serial = host,
+        .serial = serial_str,
         .server_path = "scrcpy-server.jar",
         .video_bit_rate = 8000000,
         .max_size = 0,
@@ -234,6 +235,7 @@ int main(int argc, char *argv[]) {
     }
 
     parse_serial(argv[1]);
+    snprintf(serial_str, sizeof(serial_str), "%s:%u", host, port);
     printf("Device: %s:%u\n", host, port);
     printf("================================\n");
 
