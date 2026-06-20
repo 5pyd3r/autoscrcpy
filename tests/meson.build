@@ -76,6 +76,12 @@ test_video_decoder = executable('test_video_decoder', 'test_video_decoder.c',
 )
 test('Video decoder test', test_video_decoder)
 
+test_shared_frame = executable('test_shared_frame', 'test_shared_frame.c',
+    '../src/platform/log.c',
+    dependencies: winlibs,
+)
+test('Shared frame test', test_shared_frame)
+
 # ============================================================
 # Manual tests (device required, run directly with serial arg)
 # ============================================================

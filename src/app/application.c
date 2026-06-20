@@ -2,9 +2,6 @@
 #include "../platform/log.h"
 #include "../adb/adb.h"
 #include "../device/server.h"
-#include "../input/keycode_map.h"
-#include "../input/input_transform.h"
-#include "../control/control_msg.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -14,81 +11,18 @@ static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons,
 static void on_wheel_event(int32_t x, int32_t y, int32_t delta, void *userdata);
 static void on_resize(int32_t width, int32_t height, void *userdata);
 
-/* Video thread: reads H.264 from socketpair, decodes, puts frame in shared buffer.
- * NO D3D here — rendering is on the main thread (DXGI requirement). */
-static DWORD WINAPI video_thread_func(LPVOID arg) {
-    application_t *app = (application_t *)arg;
-    uint8_t buf[128 * 1024];
-
-    while (app->running) {
-        int n = recv(app->video_sock.fd, (char *)buf, sizeof(buf), 0);
-        if (n <= 0) break;
-
-        video_frame_t frame;
-        memset(&frame, 0, sizeof(frame));
-        if (video_decoder_decode(app->video_decoder, buf, (uint32_t)n, &frame)) {
-            /* Latest-frame-wins: overwrite shared buffer */
-            shared_frame_t *sf = &app->shared_frame;
-            uint8_t *old = InterlockedExchangePointer(
-                (volatile PVOID *)&sf->data, frame.data);
-            sf->width = frame.width;
-            sf->height = frame.height;
-            InterlockedExchange(&sf->ready, 1);
-            if (old) free(old);
-            frame.data = NULL;
-        }
-    }
-    return 0;
-}
-
-static DWORD WINAPI audio_receiver_thread(LPVOID arg) {
-    application_t *app = (application_t *)arg;
-    audio_socket_t *sock = &app->audio_sock;
-    audio_decoder_t *dec = app->audio_decoder;
-    audio_player_t *player = app->audio_player;
-
-    while (app->running) {
-        /* 1. Read one audio packet */
-        uint8_t *data = NULL;
-        uint32_t size = 0;
-        if (!audio_socket_read_packet(sock, &data, &size)) {
-            if (app->running) log_error("audio socket read failed");
-            break;
-        }
-
-        /* 2. Decode */
-        audio_frame_t aframe;
-        memset(&aframe, 0, sizeof(aframe));
-        if (!audio_decoder_decode(dec, data, size, &aframe)) {
-            free(data);
-            continue;  /* skip on decode failure (config packet or error) */
-        }
-        free(data);
-
-        /* 3. Write directly to WASAPI (no regulator) */
-        if (aframe.data) {
-            audio_player_write(player, aframe.data, aframe.size);
-            free(aframe.data);
-        }
-    }
-    return 0;
-}
-
 bool application_init(application_t *app, const struct scrcpy_options *options) {
     app->options = *options;
     app->running = false;
     app->video_decoder = NULL;
     app->audio_decoder = NULL;
     app->audio_player = NULL;
-    app->video_thread = NULL;
-    app->audio_thread = NULL;
-    app->stop_event = NULL;
     app->device_width = 0;
     app->device_height = 0;
     memset(&app->video_sock, 0, sizeof(app->video_sock));
     memset(&app->audio_sock, 0, sizeof(app->audio_sock));
     memset(&app->control_sock, 0, sizeof(app->control_sock));
-    memset(&app->shared_frame, 0, sizeof(app->shared_frame));
+    shared_frame_init(&app->shared_frame);
     memset(&app->d3d_ctx, 0, sizeof(app->d3d_ctx));
     memset(&app->renderer, 0, sizeof(app->renderer));
 
@@ -131,7 +65,16 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
         application_destroy(app);
         return false;
     }
-    app->stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    /* Initialize controller */
+    controller_init(&app->controller, &app->control_sock);
+
+    /* Initialize pipelines (thread not started yet) */
+    video_pipeline_init(&app->video_pipeline, app->video_decoder,
+                        &app->video_sock, &app->shared_frame);
+    audio_pipeline_init(&app->audio_pipeline, app->audio_decoder,
+                        app->audio_player, &app->audio_sock);
+
     app->video_sock.fd = INVALID_SOCKFD;
     app->audio_sock.fd = INVALID_SOCKFD;
     app->control_sock.fd = INVALID_SOCKFD;
@@ -190,13 +133,18 @@ int application_run(application_t *app) {
         log_info("Video: %ux%u", app->video_sock.width, app->video_sock.height);
     }
 
+    /* Configure controller with device dimensions */
+    controller_set_device_size(&app->controller, app->device_width, app->device_height);
+    controller_set_enabled(&app->controller, app->options.control);
+
     window_show(&app->window);
     app->running = true;
 
+    /* Start pipelines */
     if (app->options.video)
-        app->video_thread = CreateThread(NULL, 0, video_thread_func, app, 0, NULL);
+        video_pipeline_start(&app->video_pipeline);
     if (app->options.audio && app->audio_sock.fd != INVALID_SOCKFD)
-        app->audio_thread = CreateThread(NULL, 0, audio_receiver_thread, app, 0, NULL);
+        audio_pipeline_start(&app->audio_pipeline);
 
     /* Main message loop: PeekMessage (non-blocking) + idle render.
      * Pattern from reference/d3d_video MessageLoop. */
@@ -214,23 +162,21 @@ int application_run(application_t *app) {
             DispatchMessage(&msg);
         } else {
             /* Idle: render latest decoded frame */
-            if (app->shared_frame.ready) {
-                shared_frame_t *sf = &app->shared_frame;
+            frame_data_t *fd = shared_frame_acquire(&app->shared_frame);
+            if (fd) {
                 video_frame_t frame = {0};
-                frame.data = InterlockedExchangePointer(
-                    (volatile PVOID *)&sf->data, NULL);
-                frame.width = sf->width;
-                frame.height = sf->height;
-                InterlockedExchange(&sf->ready, 0);
+                frame.data = fd->data;
+                frame.width = fd->width;
+                frame.height = fd->height;
+                fd->data = NULL; /* Transfer ownership */
 
                 render_count++;
                 fps_count++;
-                (void)render_count; /* used for debugging only */
+                (void)render_count;
 
                 d3d_context_begin_frame(&app->d3d_ctx);
                 video_renderer_render(&app->renderer, &frame);
                 d3d_context_end_frame(&app->d3d_ctx);
-                video_frame_free(&frame);
 
                 /* Update window title with video info every second */
                 DWORD now = GetTickCount();
@@ -245,6 +191,9 @@ int application_run(application_t *app) {
                              app->options.video_bit_rate / 1000);
                     SetWindowTextA(app->window.hwnd, title_buf);
                 }
+
+                video_frame_free(&frame);
+                frame_data_free(fd);
             } else {
                 Sleep(1);
             }
@@ -252,159 +201,48 @@ int application_run(application_t *app) {
     }
     server_kill(&app->server);
 
-    if (app->video_thread) {
-        WaitForSingleObject(app->video_thread, 3000);
-        CloseHandle(app->video_thread);
-    }
-    if (app->audio_thread) {
-        WaitForSingleObject(app->audio_thread, 2000);
-        CloseHandle(app->audio_thread);
-    }
+    /* Stop pipelines (graceful shutdown with socket close) */
+    video_pipeline_stop(&app->video_pipeline);
+    audio_pipeline_stop(&app->audio_pipeline);
 
     server_destroy(&app->server);
     return 0;
 }
 
 void application_destroy(application_t *app) {
-    if (app->stop_event) { CloseHandle(app->stop_event); app->stop_event = NULL; }
+    video_pipeline_destroy(&app->video_pipeline);
+    audio_pipeline_destroy(&app->audio_pipeline);
     if (app->video_decoder) { video_decoder_destroy(app->video_decoder); app->video_decoder = NULL; }
     if (app->audio_decoder) { audio_decoder_destroy(app->audio_decoder); app->audio_decoder = NULL; }
     if (app->audio_player) { audio_player_destroy(app->audio_player); app->audio_player = NULL; }
     video_renderer_destroy(&app->renderer);
     d3d_context_destroy(&app->d3d_ctx);
-    if (app->shared_frame.data) { free(app->shared_frame.data); app->shared_frame.data = NULL; }
+    if (app->shared_frame.current) {
+        frame_data_free(app->shared_frame.current);
+        app->shared_frame.current = NULL;
+    }
     if (app->video_sock.fd != INVALID_SOCKFD) { video_socket_destroy(&app->video_sock); app->video_sock.fd = INVALID_SOCKFD; }
     if (app->audio_sock.fd != INVALID_SOCKFD) { audio_socket_destroy(&app->audio_sock); app->audio_sock.fd = INVALID_SOCKFD; }
     if (app->control_sock.fd != INVALID_SOCKFD) { control_socket_destroy(&app->control_sock); app->control_sock.fd = INVALID_SOCKFD; }
     adb_destroy();
 }
 
-static void send_keycode(application_t *app, uint32_t kc, bool down) {
-    uint8_t buf[64];
-    uint32_t args[4] = {down ? 0 : 1, kc, 0, get_android_metastate()};
-    uint32_t len = control_msg_serialize(CONTROL_MSG_TYPE_INJECT_KEYCODE, args, buf, sizeof(buf));
-    if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
-}
-
-static void send_display_power(application_t *app, bool on) {
-    uint8_t buf[64];
-    uint32_t len = control_msg_serialize(CONTROL_MSG_TYPE_SET_DISPLAY_POWER, &on, buf, sizeof(buf));
-    if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
-}
+/* Window callbacks — delegate to controller */
 
 static void on_key_event(uint32_t vk, bool down, void *userdata) {
     application_t *app = (application_t *)userdata;
-    if (!app->options.control) return;
-
-    bool alt = GetKeyState(VK_MENU) & 0x8000;
-    bool shift = GetKeyState(VK_SHIFT) & 0x8000;
-
-    /* Alt + key shortcuts (scrcpy compatible) */
-    if (alt && down) {
-        switch (vk) {
-            case 'P': /* Alt+P: Power button */
-                send_keycode(app, 26, true);
-                send_keycode(app, 26, false);
-                log_info("Alt+P: Power");
-                return;
-            case 'O': /* Alt+O: Display on, Alt+Shift+O: Display off */
-                send_display_power(app, !shift);
-                log_info("Alt+%sO: Display %s", shift ? "Shift+" : "", shift ? "off" : "on");
-                return;
-            case VK_UP: /* Alt+Up: Volume up */
-                send_keycode(app, 24, true);
-                send_keycode(app, 24, false);
-                log_info("Alt+Up: Volume up");
-                return;
-            case VK_DOWN: /* Alt+Down: Volume down */
-                send_keycode(app, 25, true);
-                send_keycode(app, 25, false);
-                log_info("Alt+Down: Volume down");
-                return;
-            case 'M': /* Alt+M: Menu */
-                send_keycode(app, 82, true);
-                send_keycode(app, 82, false);
-                log_info("Alt+M: Menu");
-                return;
-            case 'A': /* Alt+A: App switch */
-                send_keycode(app, 187, true);
-                send_keycode(app, 187, false);
-                log_info("Alt+A: App switch");
-                return;
-            case VK_BACK: /* Alt+Backspace: Back or screen on */
-                {
-                    uint8_t buf[64];
-                    uint32_t action = 0; /* DOWN */
-                    uint32_t len = control_msg_serialize(CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON, &action, buf, sizeof(buf));
-                    if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
-                    action = 1; /* UP */
-                    len = control_msg_serialize(CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON, &action, buf, sizeof(buf));
-                    if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
-                    log_info("Alt+Backspace: Back or screen on");
-                }
-                return;
-        }
-    }
-
-    /* Regular key injection (no Alt held) */
-    if (!alt) {
-        uint32_t kc = vk_to_android_keycode(vk);
-        if (kc == 0) return;
-        send_keycode(app, kc, down);
-    }
+    controller_on_key_event(&app->controller, vk, down);
 }
 
-static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons, uint32_t action, void *userdata) {
+static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons,
+                            uint32_t action, void *userdata) {
     application_t *app = (application_t *)userdata;
-    if (!app->options.control || !app->device_width || !app->device_height) return;
-
-    /* Only send events when a button is pressed (click/drag).
-     * Pure mouse movement without button pressed is not sent to device. */
-    if (action == 2 && buttons == 0) return;
-
-    int32_t dx, dy;
-    input_transform_coords(x, y, &dx, &dy, app->window.width, app->window.height,
-                           app->device_width, app->device_height);
-
-    /* Map window action to Android action: DOWN=0, UP=1, MOVE=2 */
-    uint32_t android_action = (action == 1) ? 0 : (action == 0) ? 1 : 2;
-
-    /* Determine which button caused the event */
-    uint32_t action_button;
-    if (buttons & 1) {
-        action_button = 1; /* Left button */
-    } else if (buttons & 2) {
-        action_button = 2; /* Right button */
-    } else {
-        action_button = 1;
-    }
-
-    /* Pressure: full when button held, none for UP */
-    uint16_t pressure = (action == 0) ? 0 : 0xFFFF;
-    /* Buttons state: UP event → no buttons pressed */
-    uint32_t buttons_state = (action == 0) ? 0 : action_button;
-
-    uint8_t buf[64];
-    uint32_t args[10] = {
-        android_action, 0xFFFFFFFF, 0xFFFFFFFF,
-        (uint32_t)dx, (uint32_t)dy,
-        (uint32_t)app->device_width, (uint32_t)app->device_height,
-        pressure, action_button, buttons_state
-    };
-    uint32_t len = control_msg_serialize(CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT, args, buf, sizeof(buf));
-    if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
+    controller_on_mouse_event(&app->controller, x, y, buttons, action);
 }
 
 static void on_wheel_event(int32_t x, int32_t y, int32_t delta, void *userdata) {
     application_t *app = (application_t *)userdata;
-    if (!app->options.control || !app->device_width || !app->device_height) return;
-    int32_t dx, dy;
-    input_transform_coords(x, y, &dx, &dy, app->window.width, app->window.height,
-                           app->device_width, app->device_height);
-    uint8_t buf[64];
-    int32_t args[7] = {dx, dy, (int32_t)app->device_width, (int32_t)app->device_height, 0, delta / WHEEL_DELTA, 0};
-    uint32_t len = control_msg_serialize(CONTROL_MSG_TYPE_INJECT_SCROLL_EVENT, args, buf, sizeof(buf));
-    if (len > 0) control_socket_send_msg(&app->control_sock, buf, len);
+    controller_on_wheel_event(&app->controller, x, y, delta);
 }
 
 static void on_resize(int32_t width, int32_t height, void *userdata) {
@@ -412,5 +250,6 @@ static void on_resize(int32_t width, int32_t height, void *userdata) {
     if (width > 0 && height > 0) {
         d3d_context_resize(&app->d3d_ctx, width, height);
         video_renderer_set_window_size(&app->renderer, (uint32_t)width, (uint32_t)height);
+        controller_set_window_size(&app->controller, (uint32_t)width, (uint32_t)height);
     }
 }
