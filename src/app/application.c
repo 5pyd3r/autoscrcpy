@@ -43,18 +43,33 @@ static DWORD WINAPI video_thread_func(LPVOID arg) {
 
 static DWORD WINAPI audio_receiver_thread(LPVOID arg) {
     application_t *app = (application_t *)arg;
+    audio_socket_t *sock = &app->audio_sock;
+    audio_decoder_t *dec = app->audio_decoder;
+    audio_player_t *player = app->audio_player;
+
     while (app->running) {
+        /* 1. Read one audio packet */
         uint8_t *data = NULL;
         uint32_t size = 0;
-        if (!audio_socket_read_packet(&app->audio_sock, &data, &size)) break;
+        if (!audio_socket_read_packet(sock, &data, &size)) {
+            if (app->running) log_error("audio socket read failed");
+            break;
+        }
+
+        /* 2. Decode */
         audio_frame_t aframe;
         memset(&aframe, 0, sizeof(aframe));
-        if (audio_decoder_decode(app->audio_decoder, data, size, &aframe)) {
-            if (app->audio_player && aframe.data)
-                audio_player_write(app->audio_player, aframe.data, aframe.size);
-            if (aframe.data) free(aframe.data);
+        if (!audio_decoder_decode(dec, data, size, &aframe)) {
+            free(data);
+            continue;  /* skip on decode failure (config packet or error) */
         }
         free(data);
+
+        /* 3. Write directly to WASAPI (no regulator) */
+        if (aframe.data) {
+            audio_player_write(player, aframe.data, aframe.size);
+            free(aframe.data);
+        }
     }
     return 0;
 }
@@ -116,11 +131,6 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
         application_destroy(app);
         return false;
     }
-    if (!audio_player_init(app->audio_player, 48000, 2)) {
-        log_warn("Audio player init failed (WASAPI unavailable)");
-        /* Non-fatal: audio just won't work */
-    }
-
     app->stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
     app->video_sock.fd = INVALID_SOCKFD;
     app->audio_sock.fd = INVALID_SOCKFD;
@@ -146,6 +156,25 @@ int application_run(application_t *app) {
                       &app->control_sock)) {
         log_error("Server start failed");
         return 1;
+    }
+
+    /* Initialize audio pipeline if audio channel is available */
+    if (app->options.audio && app->audio_sock.fd != INVALID_SOCKFD) {
+        if (audio_socket_read_metadata(&app->audio_sock)) {
+            if (audio_decoder_init(app->audio_decoder, app->audio_sock.codec_id,
+                                   app->audio_sock.sample_rate, app->audio_sock.channels)) {
+                if (audio_player_init(app->audio_player, app->audio_sock.sample_rate,
+                                      app->audio_sock.channels)) {
+                    log_info("Audio pipeline ready");
+                } else {
+                    log_warn("Audio player init failed (WASAPI unavailable)");
+                }
+            } else {
+                log_error("Audio decoder init failed");
+            }
+        } else {
+            log_warn("Audio metadata read failed, audio disabled");
+        }
     }
 
     if (app->options.video && app->video_sock.codec_id != 0) {
