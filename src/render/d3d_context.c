@@ -33,8 +33,9 @@ bool d3d_context_init(d3d_context_t *ctx, HWND hwnd, int width, int height) {
         return false;
     }
 
-    /* Enable multi-threaded protection so the video thread can render
-     * while the main thread processes Win32 messages */
+    /* Enable multi-threaded protection as a safety net.
+     * D3D11 device is created and used on the main thread only (DXGI requirement),
+     * but this protects against accidental cross-thread access. */
     {
         ID3D10Multithread *mt = NULL;
         hr = ctx->device_ctx->lpVtbl->QueryInterface(
