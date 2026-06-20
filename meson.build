@@ -18,6 +18,7 @@ libavcodec_dep = dependency('libavcodec', required: true)
 libavformat_dep = dependency('libavformat', required: true)
 libavutil_dep = dependency('libavutil', required: true)
 libswscale_dep = dependency('libswscale', required: true)
+libswresample_dep = dependency('libswresample', required: true)
 mbedtls_dep = dependency('mbedtls', required: true)
 
 # Windows libraries

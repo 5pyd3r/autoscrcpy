@@ -36,6 +36,47 @@ bool audio_socket_accept(audio_socket_t *sock, SOCKET_T listen_fd) {
     return true;
 }
 
+bool audio_socket_read_metadata(audio_socket_t *sock) {
+    /* scrcpy-server sends audio metadata as 4-byte codec_id (big-endian).
+     * For audio, sample_rate and channels are hardcoded per scrcpy protocol:
+     * Opus/AAC/FLAC: 48000 Hz, 2 channels (stereo). */
+    uint8_t buf[4];
+    size_t received = 0;
+    while (received < 4) {
+        int n = recv(sock->fd, (char *)buf + received, 4 - received, 0);
+        if (n <= 0) {
+            if (n < 0 && SOCKET_ERRNO == WOULDBLOCK_ERR) continue;
+            log_error("Failed to read audio metadata");
+            return false;
+        }
+        received += n;
+    }
+
+    sock->codec_id = read32be(buf);
+
+    if (sock->codec_id == 0) {
+        log_warn("Audio stream disabled by server");
+        return false;
+    }
+    if (sock->codec_id == 1) {
+        log_error("Audio config error reported by server");
+        return false;
+    }
+
+    /* scrcpy protocol hardcodes stereo 48kHz for all audio codecs */
+    sock->sample_rate = 48000;
+    sock->channels = 2;
+
+    const char *name = "unknown";
+    if (sock->codec_id == 0x6f707573) name = "Opus";
+    else if (sock->codec_id == 0x00616163) name = "AAC";
+    else if (sock->codec_id == 0x666c6163) name = "FLAC";
+    log_info("Audio codec: %s (0x%08x), %u Hz, %u ch",
+             name, sock->codec_id, sock->sample_rate, sock->channels);
+
+    return true;
+}
+
 bool audio_socket_read_packet(audio_socket_t *sock, uint8_t **data, uint32_t *size) {
     // Read packet header (12 bytes: pts + size)
     uint8_t header[12];
