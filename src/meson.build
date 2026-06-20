@@ -75,6 +75,7 @@ app_src = files(
     'app/window.c',
     'app/options.c',
     'app/cli.c',
+    'app/config.c',
 )
 
 # Main executable

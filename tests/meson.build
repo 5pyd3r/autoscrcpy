@@ -69,6 +69,14 @@ test_crypto = executable('test_crypto', 'test_crypto.c',
 )
 test('Crypto test', test_crypto)
 
+test_config = executable('test_config', 'test_config.c',
+    '../src/app/config.c',
+    '../src/app/options.c',
+    '../src/platform/log.c',
+    dependencies: winlibs,
+)
+test('Config test', test_config)
+
 test_video_decoder = executable('test_video_decoder', 'test_video_decoder.c',
     '../src/decode/video_decoder.c',
     '../src/platform/log.c',

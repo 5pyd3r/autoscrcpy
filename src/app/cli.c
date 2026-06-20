@@ -1,4 +1,5 @@
 #include "cli.h"
+#include "config.h"
 #include "../platform/log.h"
 #include <string.h>
 #include <stdlib.h>
@@ -7,8 +8,32 @@
 bool cli_parse(int argc, char *argv[], struct scrcpy_options *options) {
     *options = scrcpy_options_default;
 
+    /* First pass: find -c/--config */
+    const char *config_path = NULL;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--serial") == 0) {
+        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
+            if (i + 1 >= argc) {
+                log_error("Missing config file path after -c/--config");
+                return false;
+            }
+            config_path = argv[++i];
+        }
+    }
+
+    /* Load config file if specified */
+    if (config_path) {
+        if (!config_parse(config_path, options)) {
+            log_error("Failed to load config file: %s", config_path);
+            return false;
+        }
+    }
+
+    /* Second pass: CLI arguments override config values */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
+            i++; /* skip config path value */
+            continue;
+        } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--serial") == 0) {
             if (i + 1 >= argc) {
                 log_error("Missing serial number");
                 return false;
@@ -76,6 +101,7 @@ bool cli_parse(int argc, char *argv[], struct scrcpy_options *options) {
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: autoscrcpy [options]\n");
             printf("Options:\n");
+            printf("  -c, --config <file>        Load config file\n");
             printf("  -s, --serial <serial>      Device serial number\n");
             printf("  -p, --port <port>          ADB port (default: 5555)\n");
             printf("  -m, --max-size <size>      Max video size\n");
