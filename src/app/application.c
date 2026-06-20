@@ -4,6 +4,7 @@
 #include "../device/server.h"
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 static void on_key_event(uint32_t vk, bool down, void *userdata);
 static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons,
@@ -81,6 +82,9 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
     return true;
 }
 
+static void application_resize_window_for_video(application_t *app,
+                                                 uint32_t video_w, uint32_t video_h);
+
 int application_run(application_t *app) {
     struct server_config server_cfg = {
         .serial = app->options.serial,
@@ -137,6 +141,11 @@ int application_run(application_t *app) {
     controller_set_device_size(&app->controller, app->device_width, app->device_height);
     controller_set_enabled(&app->controller, app->options.control);
 
+    /* Resize window to match initial video aspect ratio (avoid black bars) */
+    if (app->device_width > 0 && app->device_height > 0) {
+        application_resize_window_for_video(app, app->device_width, app->device_height);
+    }
+
     window_show(&app->window);
     app->running = true;
 
@@ -164,6 +173,16 @@ int application_run(application_t *app) {
             /* Idle: render latest decoded frame */
             frame_data_t *fd = shared_frame_acquire(&app->shared_frame);
             if (fd) {
+                /* Detect video dimension change (e.g. device rotation) */
+                if (fd->width != app->device_width || fd->height != app->device_height) {
+                    log_info("Video dimensions changed: %ux%u -> %ux%u",
+                             app->device_width, app->device_height, fd->width, fd->height);
+                    app->device_width = fd->width;
+                    app->device_height = fd->height;
+                    controller_set_device_size(&app->controller, fd->width, fd->height);
+                    application_resize_window_for_video(app, fd->width, fd->height);
+                }
+
                 video_frame_t frame = {0};
                 frame.data = fd->data;
                 frame.width = fd->width;
@@ -225,6 +244,42 @@ void application_destroy(application_t *app) {
     if (app->audio_sock.fd != INVALID_SOCKFD) { audio_socket_destroy(&app->audio_sock); app->audio_sock.fd = INVALID_SOCKFD; }
     if (app->control_sock.fd != INVALID_SOCKFD) { control_socket_destroy(&app->control_sock); app->control_sock.fd = INVALID_SOCKFD; }
     adb_destroy();
+}
+
+static void application_resize_window_for_video(application_t *app,
+                                                 uint32_t video_w, uint32_t video_h) {
+    if (video_w == 0 || video_h == 0) return;
+
+    /* Get current client area to preserve display area across rotations */
+    RECT client;
+    GetClientRect(app->window.hwnd, &client);
+    int cur_w = client.right - client.left;
+    int cur_h = client.bottom - client.top;
+    if (cur_w <= 0 || cur_h <= 0) return;
+
+    /* Preserve display area: new dimensions give same client-area pixels */
+    double area = (double)cur_w * cur_h;
+    double aspect = (double)video_w / video_h;
+    int new_w = (int)(sqrt(area * aspect) + 0.5);
+    int new_h = (int)(sqrt(area / aspect) + 0.5);
+
+    /* Cap at screen bounds */
+    int screen_w = GetSystemMetrics(SM_CXSCREEN);
+    int screen_h = GetSystemMetrics(SM_CYSCREEN);
+    if (new_w > screen_w) {
+        new_w = screen_w;
+        new_h = (int)(new_w / aspect + 0.5);
+    }
+    if (new_h > screen_h) {
+        new_h = screen_h;
+        new_w = (int)(new_h * aspect + 0.5);
+    }
+
+    RECT rect = {0, 0, new_w, new_h};
+    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    SetWindowPos(app->window.hwnd, NULL, 0, 0,
+                 rect.right - rect.left, rect.bottom - rect.top,
+                 SWP_NOMOVE | SWP_NOZORDER);
 }
 
 /* Window callbacks — delegate to controller */
