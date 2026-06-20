@@ -84,6 +84,6 @@ executable('autoscrcpy',
     record_src,
     audio_src,
     app_src,
-    dependencies: [libavcodec_dep, libavformat_dep, libavutil_dep, libswscale_dep, mbedtls_dep] + winlibs,
+    dependencies: [libavcodec_dep, libavformat_dep, libavutil_dep, libswscale_dep, libswresample_dep, mbedtls_dep] + winlibs,
     install: true,
 )

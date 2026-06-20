@@ -14,6 +14,7 @@ typedef struct {
 
 bool audio_socket_init(audio_socket_t *sock, SOCKET_T fd);
 bool audio_socket_accept(audio_socket_t *sock, SOCKET_T listen_fd);
+bool audio_socket_read_metadata(audio_socket_t *sock);
 bool audio_socket_read_packet(audio_socket_t *sock, uint8_t **data, uint32_t *size);
 void audio_socket_destroy(audio_socket_t *sock);
 
