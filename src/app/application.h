@@ -12,15 +12,11 @@
 #include "../device/audio_socket.h"
 #include "../device/control_socket.h"
 #include "../device/server.h"
+#include "../pipeline/pipeline.h"
+#include "../pipeline/video_pipeline.h"
+#include "../pipeline/audio_pipeline.h"
+#include "../control/controller.h"
 #include <stdbool.h>
-
-/* Shared frame: video thread decodes, main thread renders */
-typedef struct {
-    uint8_t *data;       /* NV12 pixel data (freed by consumer) */
-    uint32_t width;
-    uint32_t height;
-    volatile LONG ready; /* 1 = frame available, 0 = consumed */
-} shared_frame_t;
 
 typedef struct {
     struct scrcpy_options options;
@@ -34,9 +30,9 @@ typedef struct {
     audio_socket_t audio_sock;
     control_socket_t control_sock;
     server_t server;
-    HANDLE video_thread;
-    HANDLE audio_thread;
-    HANDLE stop_event;
+    video_pipeline_t video_pipeline;
+    audio_pipeline_t audio_pipeline;
+    controller_t controller;
     bool running;
     uint32_t device_width;
     uint32_t device_height;

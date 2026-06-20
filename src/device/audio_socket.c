@@ -96,6 +96,13 @@ bool audio_socket_read_packet(audio_socket_t *sock, uint8_t **data, uint32_t *si
     uint32_t packet_size = read32be(header + 8);
     (void)pts; // Unused for now
 
+#define MAX_AUDIO_PACKET_SIZE (1024 * 1024)  /* 1MB */
+
+    if (packet_size > MAX_AUDIO_PACKET_SIZE) {
+        log_error("Audio packet too large: %u bytes", packet_size);
+        return false;
+    }
+
     // Allocate buffer
     *data = malloc(packet_size);
     if (!*data) {

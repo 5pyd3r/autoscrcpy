@@ -6,6 +6,7 @@
 #include "../adb/tls.h"
 #include "../adb/binary.h"
 #include "../platform/log.h"
+#include "../platform/net_util.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,7 @@ bool server_init(server_t *srv, const struct server_config *config) {
     srv->reader_thread = NULL;
     srv->reader_running = NULL;
     srv->running = false;
+    srv->reader = NULL;
     return true;
 }
 
@@ -39,173 +41,6 @@ static bool parse_serial(const char *serial, char *host, int host_size,
         *port = 5555;
     }
     return true;
-}
-
-/* Connect directly to device adbd and do CNXN/STLS/TLS handshake.
- * Returns an adb_connection_t* on success, NULL on failure.
- * All logic is inline to avoid cross-module linker issues. */
-static adb_connection_t *do_adb_connect(const char *host, uint16_t port) {
-    adb_connection_t *conn = calloc(1, sizeof(adb_connection_t));
-    if (!conn) return NULL;
-    conn->next_local_id = 1;
-    conn->max_payload = ADB_MAX_PAYLOAD;
-
-    /* TCP connect (blocking) */
-    SOCKET_T fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == INVALID_SOCKFD) { free(conn); return NULL; }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, host, &addr.sin_addr);
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        log_error("TCP connect to %s:%u failed", host, port);
-        CLOSESOCKET(fd);
-        free(conn);
-        return NULL;
-    }
-    conn->fd = fd;
-    /* Disable Nagle's algorithm so small packets (OKAY ACKs) are sent immediately */
-    {
-        int flag = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
-    }
-    log_info("TCP connected to %s:%u", host, port);
-
-    /* Send CNXN */
-    {
-        uint8_t pkt[48];
-        memset(pkt, 0, 48);
-        write32le(pkt + 0, ADB_CNXN);
-        write32le(pkt + 4, ADB_VERSION);
-        write32le(pkt + 8, (uint32_t)ADB_MAX_PAYLOAD);
-        write32le(pkt + 12, 24); /* banner len + null */
-        write32le(pkt + 16, 0);
-        write32le(pkt + 20, ADB_CNXN ^ 0xffffffff);
-        memcpy(pkt + 24, "host::features=shell_v2", 24);
-        send(fd, (const char *)pkt, 48, 0);
-    }
-
-    /* Read device response(s) */
-    for (int tries = 0; tries < 100 && conn->state != ADB_STATE_CONNECTED; tries++) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        struct timeval tv = {1, 0};
-        if (select(0, &rfds, NULL, NULL, &tv) <= 0) continue;
-
-        uint8_t hdr[24];
-        int got = 0;
-        while (got < 24) {
-            int n = recv(fd, (char *)hdr + got, 24 - got, 0);
-            if (n <= 0) goto fail;
-            got += n;
-        }
-
-        uint32_t cmd  = read32le(hdr + 0);
-        uint32_t arg0 = read32le(hdr + 4);
-        uint32_t dlen = read32le(hdr + 12);
-        uint32_t mag  = read32le(hdr + 20);
-        if (mag != (cmd ^ 0xffffffff)) goto fail;
-
-        uint8_t payload[4096];
-        if (dlen > 0 && dlen <= sizeof(payload)) {
-            got = 0;
-            while (got < (int)dlen) {
-                int n = recv(fd, (char *)payload + got, dlen - got, 0);
-                if (n <= 0) goto fail;
-                got += n;
-            }
-        }
-
-        if (cmd == ADB_STLS) {
-            log_info("adbd requires TLS");
-            /* Reply STLS — use adb_send_msg like reference */
-            adb_send_msg(fd, ADB_STLS, 0x01000000, 0, NULL, 0, 0);
-
-            conn->tls_ctx = tls_handshake(fd);
-            if (!conn->tls_ctx) { log_error("TLS handshake failed"); goto fail; }
-            log_info("TLS handshake OK, tls_ctx=%p", conn->tls_ctx);
-
-            /* Per reference: after TLS handshake, device speaks first.
-             * Wait for device AUTH/CNXN before sending our CNXN. */
-            log_info("Waiting for device to speak first after TLS...");
-            for (int t2 = 0; t2 < 50 && conn->state != ADB_STATE_CONNECTED; t2++) {
-                adb_message_t rmsg;
-                uint8_t rpl[4096];
-                int ret2 = adb_recv_msg_conn(conn, &rmsg, rpl, sizeof(rpl), 1);
-                if (ret2 < 0) { Sleep(100); continue; }
-
-                log_info("TLS post-handshake: cmd=0x%08x arg0=0x%08x arg1=0x%08x dlen=%u",
-                         rmsg.command, rmsg.arg0, rmsg.arg1, rmsg.data_length);
-
-                if (rmsg.command == ADB_AUTH && rmsg.arg0 == ADB_AUTH_TYPE_TOKEN) {
-                    /* Device sent AUTH token — sign it */
-                    uint8_t sig2[512]; int sl2 = 0;
-                    if (crypto_sign_token(rpl, rmsg.data_length, sig2, &sl2) == 0) {
-                        adb_send_msg_conn(conn, ADB_AUTH, ADB_AUTH_TYPE_RSAKEY, 0,
-                                          sig2, (uint32_t)sl2, 1);
-                    }
-                } else if (rmsg.command == ADB_STLS) {
-                    /* adbd re-sent STLS — reply and continue */
-                    adb_send_msg_conn(conn, ADB_STLS, ADB_STLS_VERSION, 0, NULL, 0, 0);
-                } else if (rmsg.command == ADB_CNXN) {
-                    /* Device sent CNXN — parse banner. Do NOT send CNXN reply:
-                     * sending CNXN triggers adbd's handle_offline → t->online=false,
-                     * causing subsequent OPEN to be rejected. */
-                    conn->protocol_version = (int)(rmsg.arg0 < (uint32_t)ADB_VERSION
-                                                   ? rmsg.arg0 : (uint32_t)ADB_VERSION);
-                    conn->max_payload = (size_t)(rmsg.arg1 < (uint32_t)ADB_MAX_PAYLOAD
-                                                 ? rmsg.arg1 : (uint32_t)ADB_MAX_PAYLOAD);
-                    if (rmsg.data_length > 0) {
-                        int cl = (int)rmsg.data_length;
-                        if (cl >= BANNER_MAX) cl = BANNER_MAX - 1;
-                        memcpy(conn->banner, rpl, cl);
-                        conn->banner[cl] = '\0';
-                    }
-                    conn->cnxn_sent = 1;
-                    conn->state = ADB_STATE_CONNECTED;
-                    log_info("ADB connected (TLS): %s", conn->banner);
-                    /* Do NOT send CNXN reply — see comment above */
-                }
-            }
-            if (conn->state != ADB_STATE_CONNECTED) goto fail;
-            break;
-
-        } else if (cmd == ADB_AUTH && arg0 == ADB_AUTH_TYPE_TOKEN) {
-            uint8_t sig[512]; int sl = 0;
-            if (crypto_sign_token(payload, dlen, sig, &sl) == 0) {
-                adb_send_msg_conn(conn, ADB_AUTH, ADB_AUTH_TYPE_RSAKEY, 0,
-                                  sig, (uint32_t)sl, 1);
-            }
-        } else if (cmd == ADB_CNXN) {
-            conn->protocol_version = (int)(arg0 < (uint32_t)ADB_VERSION
-                                           ? arg0 : (uint32_t)ADB_VERSION);
-            conn->max_payload = (size_t)(read32le(hdr + 8) < (uint32_t)ADB_MAX_PAYLOAD
-                                         ? read32le(hdr + 8) : (uint32_t)ADB_MAX_PAYLOAD);
-            conn->state = ADB_STATE_CONNECTED;
-            if (dlen > 0) {
-                int cl = (int)dlen;
-                if (cl >= BANNER_MAX) cl = BANNER_MAX - 1;
-                memcpy(conn->banner, payload, cl);
-                conn->banner[cl] = '\0';
-            }
-            log_info("ADB connected: %s", conn->banner);
-        }
-    }
-
-    if (conn->state == ADB_STATE_CONNECTED) {
-        log_info("do_adb_connect returning: tls_ctx=%p", conn->tls_ctx);
-        return conn;
-    }
-
-fail:
-    if (conn->tls_ctx) { tls_free(conn->tls_ctx); conn->tls_ctx = NULL; }
-    CLOSESOCKET(fd);
-    free(conn);
-    return NULL;
 }
 
 /* Create a TCP loopback socketpair (Windows doesn't have socketpair()) */
@@ -359,32 +194,35 @@ static void server_shell_output_cb(const uint8_t *data, uint32_t len, void *arg)
     fflush(stderr);
 }
 
-static int recv_exact(SOCKET_T fd, void *buf, int n) {
-    int done = 0;
-    while (done < n) {
-        int r = recv(fd, (char *)buf + done, n - done, 0);
-        if (r <= 0) return -1;
-        done += r;
-    }
-    return 0;
-}
-
 bool server_start(server_t *srv, video_socket_t *video_sock,
                   audio_socket_t *audio_sock, control_socket_t *control_sock) {
+    bool result = false;
     char device_host[256];
     uint16_t device_port;
+    adb_connection_t *conn = NULL;
+    FILE *fp = NULL;
+    adb_channel_t *sync_chan = NULL;
+    adb_channel_t *video_chan = NULL;
+    adb_channel_t *audio_chan = NULL;
+    adb_channel_t *ctrl_chan = NULL;
+    SOCKET_T sp[2] = {INVALID_SOCKFD, INVALID_SOCKFD};
+    SOCKET_T audio_sp[2] = {INVALID_SOCKFD, INVALID_SOCKFD};
+    SOCKET_T ctrl_sp[2] = {INVALID_SOCKFD, INVALID_SOCKFD};
+    adb_reader_t *reader = NULL;
+    HANDLE reader_thread = NULL;
+    HANDLE ctrl_sender = NULL;
+
     if (!parse_serial(srv->config.serial, device_host, sizeof(device_host), &device_port)) {
         log_error("Invalid serial");
-        return false;
+        goto cleanup;
     }
 
     /* Connect to device adbd */
-    adb_connection_t *conn = do_adb_connect(device_host, device_port);
+    conn = adb_connect(device_host, device_port);
     if (!conn) {
         log_error("Failed to connect to adbd at %s:%u", device_host, device_port);
-        return false;
+        goto cleanup;
     }
-    srv->adb_conn = conn;
     log_info("max_payload=%zu", conn->max_payload);
     log_info("TLS context: %s, protocol version: 0x%08x, skip_checksum: %d",
              conn->tls_ctx ? "SET" : "NULL",
@@ -417,16 +255,16 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     if (srv->config.server_path) {
         log_info("Pushing %s...", srv->config.server_path);
 
-        FILE *fp = fopen(srv->config.server_path, "rb");
-        if (!fp) { log_error("Failed to open server file"); return false; }
+        fp = fopen(srv->config.server_path, "rb");
+        if (!fp) { log_error("Failed to open server file"); goto cleanup; }
 
         /* Open sync channel */
-        adb_channel_t *chan = session_open_channel(conn, "sync:");
-        if (!chan) { log_error("Failed to open sync channel"); fclose(fp); return false; }
+        sync_chan = session_open_channel(conn, "sync:");
+        if (!sync_chan) { log_error("Failed to open sync channel"); goto cleanup; }
 
         /* Wait for channel to become open using inline TLS-aware read */
         int retries = 200;
-        while (chan->state == CHAN_OPENING && retries > 0) {
+        while (sync_chan->state == CHAN_OPENING && retries > 0) {
             fd_set rfds; FD_ZERO(&rfds); FD_SET(conn->fd, &rfds);
             struct timeval tv = {0, 100000};
             int sel = select(0, &rfds, NULL, NULL, &tv);
@@ -440,8 +278,8 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
             }
             retries--;
         }
-        if (chan->state != CHAN_OPEN) {
-            log_error("Sync channel did not open"); fclose(fp); return false;
+        if (sync_chan->state != CHAN_OPEN) {
+            log_error("Sync channel did not open"); goto cleanup;
         }
 
         /* Send SEND command (sync protocol: ID + path_length + path,mode) */
@@ -453,7 +291,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         uint32_t path_len = (uint32_t)strlen(path_mode);
         write32le(cmd_buf + 4, path_len);
         memcpy(cmd_buf + 8, path_mode, path_len);
-        adb_send_msg_conn(conn, ADB_WRTE, chan->local_id, chan->remote_id,
+        adb_send_msg_conn(conn, ADB_WRTE, sync_chan->local_id, sync_chan->remote_id,
                           cmd_buf, 8 + path_len, 1);
 
         /* Drain any pending response */
@@ -474,14 +312,14 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
             if (nread == 0) break;
             memcpy(chunk_buf, "DATA", 4);
             write32le(chunk_buf + 4, (uint32_t)nread);
-            adb_send_msg_conn(conn, ADB_WRTE, chan->local_id, chan->remote_id,
+            adb_send_msg_conn(conn, ADB_WRTE, sync_chan->local_id, sync_chan->remote_id,
                               chunk_buf, 8 + (uint32_t)nread, 1);
         }
 
         /* Send DONE */
         memcpy(chunk_buf, "DONE", 4);
         write32le(chunk_buf + 4, 0);
-        adb_send_msg_conn(conn, ADB_WRTE, chan->local_id, chan->remote_id,
+        adb_send_msg_conn(conn, ADB_WRTE, sync_chan->local_id, sync_chan->remote_id,
                           chunk_buf, 8, 1);
 
         /* Wait for sync response (OKAY or FAIL) */
@@ -495,7 +333,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                 int n = adb_recv_msg_conn(conn, &msg, pl, sizeof(pl), 1);
                 if (n == 1) {
                     /* Check if this is a sync response on the sync channel */
-                    if (msg.command == ADB_WRTE && msg.arg1 == chan->local_id &&
+                    if (msg.command == ADB_WRTE && msg.arg1 == sync_chan->local_id &&
                         msg.data_length >= 4) {
                         /* Sync IDs are little-endian: OKAY=0x59414b4f, FAIL=0x4c494146 */
                         uint32_t sync_id = read32le(pl);
@@ -516,13 +354,14 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         }
         if (!push_ok) {
             log_error("Push failed: no OKAY response");
-            session_close_channel(conn, chan);
-            fclose(fp);
-            return false;
+            goto cleanup;
         }
 
-        session_close_channel(conn, chan);
+        /* Clean up sync resources after successful push */
+        session_close_channel(conn, sync_chan);
+        sync_chan = NULL;
         fclose(fp);
+        fp = NULL;
         log_info("Push complete");
     }
 
@@ -548,7 +387,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
                  srv->config.max_size);
         log_info("Starting scrcpy-server (bitrate=%u, max_size=%u)...",
                  srv->config.video_bit_rate, srv->config.max_size);
-        if (!adb_shell(conn, cmd)) { log_error("Shell failed"); return false; }
+        if (!adb_shell(conn, cmd)) { log_error("Shell failed"); goto cleanup; }
 
         /* Drain pending messages (OKAY for shell channel, WRTE with server output) */
         log_info("Waiting for scrcpy-server to start...");
@@ -567,78 +406,76 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     /* Open channels that the server expects.
      * scrcpy-server with tunnel_forward=true does blocking accept() for each
      * channel in order: video → audio (if enabled) → control. */
-    adb_channel_t *video_chan = session_open_channel(conn, "localabstract:scrcpy");
+    video_chan = session_open_channel(conn, "localabstract:scrcpy");
     if (!video_chan) {
         log_error("Failed to open video channel");
-        return false;
+        goto cleanup;
     }
 
     /* Open audio channel if audio is enabled.
      * scrcpy-server tunnel_forward order: video → audio → control */
-    adb_channel_t *audio_chan = NULL;
     if (srv->config.audio) {
         audio_chan = session_open_channel(conn, "localabstract:scrcpy");
         if (!audio_chan) {
             log_error("Failed to open audio channel");
-            return false;
+            goto cleanup;
         }
     }
 
-    adb_channel_t *ctrl_chan = NULL;
     if (srv->config.control) {
         ctrl_chan = session_open_channel(conn, "localabstract:scrcpy");
         if (!ctrl_chan) {
             log_error("Failed to open control channel");
-            return false;
+            goto cleanup;
         }
     }
 
     /* Create socketpair for video data relay */
-    SOCKET_T sp[2];
     if (create_socketpair(sp) < 0) {
         log_error("Failed to create video socketpair");
-        return false;
+        goto cleanup;
     }
     video_sock->fd = sp[0];
 
     /* Create socketpair for audio data relay */
-    SOCKET_T audio_sp[2] = {INVALID_SOCKFD, INVALID_SOCKFD};
     if (audio_chan) {
         if (create_socketpair(audio_sp) < 0) {
             log_error("Failed to create audio socketpair");
-            return false;
+            goto cleanup;
         }
         audio_sock->fd = audio_sp[0];
     }
 
     /* Create socketpair for control data relay */
-    SOCKET_T ctrl_sp[2] = {INVALID_SOCKFD, INVALID_SOCKFD};
     if (ctrl_chan) {
         if (create_socketpair(ctrl_sp) < 0) {
             log_error("Failed to create control socketpair");
-            return false;
+            goto cleanup;
         }
         control_sock->fd = ctrl_sp[0];
     }
 
     /* Start reader thread — it handles ALL ADB messages */
-    static adb_reader_t reader;
-    reader.conn = conn;
-    reader.video_chan = video_chan;
-    reader.audio_chan = audio_chan;
-    reader.ctrl_chan = ctrl_chan;
-    reader.video_write_fd = sp[1];
-    reader.audio_write_fd = audio_sp[1];
-    reader.ctrl_write_fd = ctrl_sp[1];
-    InitializeCriticalSection(&reader.send_lock);
-    reader.running = 1;
-    srv->reader_thread = CreateThread(NULL, 0, adb_reader_thread, &reader, 0, NULL);
+    reader = calloc(1, sizeof(adb_reader_t));
+    if (!reader) {
+        log_error("Failed to allocate reader");
+        goto cleanup;
+    }
+    reader->conn = conn;
+    reader->video_chan = video_chan;
+    reader->audio_chan = audio_chan;
+    reader->ctrl_chan = ctrl_chan;
+    reader->video_write_fd = sp[1];
+    reader->audio_write_fd = audio_sp[1];
+    reader->ctrl_write_fd = ctrl_sp[1];
+    InitializeCriticalSection(&reader->send_lock);
+    reader->running = 1;
+    reader_thread = CreateThread(NULL, 0, adb_reader_thread, reader, 0, NULL);
     log_info("ADB reader thread started");
 
     /* Start control sender thread (reads from socketpair, sends to device) */
-    HANDLE ctrl_sender = NULL;
     if (ctrl_chan) {
-        ctrl_sender = CreateThread(NULL, 0, ctrl_sender_thread, &reader, 0, NULL);
+        ctrl_sender = CreateThread(NULL, 0, ctrl_sender_thread, reader, 0, NULL);
         log_info("Control sender thread started");
     }
 
@@ -649,7 +486,7 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
     }
     if (video_chan->state != CHAN_OPEN) {
         log_error("Video channel did not open");
-        return false;
+        goto cleanup;
     }
     log_info("Video channel open (remote_id=%u)", video_chan->remote_id);
 
@@ -684,54 +521,58 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
      *   dummy(1B) + device_name(64B) + codec_id(4B, BE)
      * Then the first scrcpy packet is a session header (12B) with width/height,
      * which will be read by video_socket_read_packet(). */
-    uint8_t dummy_byte;
-    if (recv_exact(video_sock->fd, &dummy_byte, 1) < 0) {
-        log_error("Failed to read video dummy byte");
-        return false;
+    {
+        uint8_t dummy_byte;
+        if (recv_all(video_sock->fd, &dummy_byte, 1) < 0) {
+            log_error("Failed to read video dummy byte");
+            goto cleanup;
+        }
     }
 
-    uint8_t devname_buf[64];
-    if (recv_exact(video_sock->fd, devname_buf, 64) < 0) {
-        log_error("Failed to read device name");
-        return false;
+    {
+        uint8_t devname_buf[64];
+        if (recv_all(video_sock->fd, devname_buf, 64) < 0) {
+            log_error("Failed to read device name");
+            goto cleanup;
+        }
+        devname_buf[63] = '\0';
+        log_info("Device: %s", devname_buf);
     }
-    devname_buf[63] = '\0';
-    log_info("Device: %s", devname_buf);
 
     /* After device_name(64B), scrcpy-server sends codec_id(4B) + width(4B) + height(4B)
      * as a single 12-byte block, followed by a 12-byte session header (bit 63 set). */
-    uint8_t codec_dim_buf[12];
-    if (recv_exact(video_sock->fd, codec_dim_buf, 12) < 0) {
-        log_error("Failed to read codec/dimensions");
-        return false;
-    }
-    video_sock->codec_id = ((uint32_t)codec_dim_buf[0]<<24)|((uint32_t)codec_dim_buf[1]<<16)|
-                            ((uint32_t)codec_dim_buf[2]<<8)|(uint32_t)codec_dim_buf[3];
-    /* Width/height from the codec+dimensions block (may be overridden by session header) */
-    uint32_t dim_w = ((uint32_t)codec_dim_buf[4]<<24)|((uint32_t)codec_dim_buf[5]<<16)|
-                      ((uint32_t)codec_dim_buf[6]<<8)|(uint32_t)codec_dim_buf[7];
-    uint32_t dim_h = ((uint32_t)codec_dim_buf[8]<<24)|((uint32_t)codec_dim_buf[9]<<16)|
-                      ((uint32_t)codec_dim_buf[10]<<8)|(uint32_t)codec_dim_buf[11];
-
-    const char *cn = "unknown";
-    if (video_sock->codec_id == 0x68323634) cn = "H.264";
-    else if (video_sock->codec_id == 0x68323635) cn = "H.265";
-    else if (video_sock->codec_id == 0x00617631) cn = "AV1";
-    log_info("Video codec: %s (0x%08x), dimensions hint: %ux%u", cn, video_sock->codec_id, dim_w, dim_h);
-
-    /* Use dimensions from the codec block — these are always correct */
-    video_sock->width = dim_w;
-    video_sock->height = dim_h;
-
-    /* Read the session header (12 bytes, first byte = 0x80).
-     * The session header may report different dimensions than the codec block;
-     * we trust the codec block dimensions. After the session header, the device
-     * sends video packets directly. */
     {
+        uint8_t codec_dim_buf[12];
+        if (recv_all(video_sock->fd, codec_dim_buf, 12) < 0) {
+            log_error("Failed to read codec/dimensions");
+            goto cleanup;
+        }
+        video_sock->codec_id = ((uint32_t)codec_dim_buf[0]<<24)|((uint32_t)codec_dim_buf[1]<<16)|
+                                ((uint32_t)codec_dim_buf[2]<<8)|(uint32_t)codec_dim_buf[3];
+        /* Width/height from the codec+dimensions block (may be overridden by session header) */
+        uint32_t dim_w = ((uint32_t)codec_dim_buf[4]<<24)|((uint32_t)codec_dim_buf[5]<<16)|
+                          ((uint32_t)codec_dim_buf[6]<<8)|(uint32_t)codec_dim_buf[7];
+        uint32_t dim_h = ((uint32_t)codec_dim_buf[8]<<24)|((uint32_t)codec_dim_buf[9]<<16)|
+                          ((uint32_t)codec_dim_buf[10]<<8)|(uint32_t)codec_dim_buf[11];
+
+        const char *cn = "unknown";
+        if (video_sock->codec_id == 0x68323634) cn = "H.264";
+        else if (video_sock->codec_id == 0x68323635) cn = "H.265";
+        else if (video_sock->codec_id == 0x00617631) cn = "AV1";
+        log_info("Video codec: %s (0x%08x), dimensions hint: %ux%u", cn, video_sock->codec_id, dim_w, dim_h);
+
+        /* Use dimensions from the codec block — these are always correct */
+        video_sock->width = dim_w;
+        video_sock->height = dim_h;
+
+        /* Read the session header (12 bytes, first byte = 0x80).
+         * The session header may report different dimensions than the codec block;
+         * we trust the codec block dimensions. After the session header, the device
+         * sends video packets directly. */
         uint8_t session_hdr[12];
-        if (recv_exact(video_sock->fd, session_hdr, 12) < 0) {
+        if (recv_all(video_sock->fd, session_hdr, 12) < 0) {
             log_error("Failed to read session header");
-            return false;
+            goto cleanup;
         }
         if (session_hdr[0] & 0x80) {
             uint32_t sw = ((uint32_t)session_hdr[4]<<24)|((uint32_t)session_hdr[5]<<16)|
@@ -750,15 +591,62 @@ bool server_start(server_t *srv, video_socket_t *video_sock,
         }
     }
 
+    /* Success — transfer ownership to srv */
     srv->adb_conn = conn;
+    conn = NULL; /* prevent cleanup from disconnecting */
     srv->video_chan = video_chan;
     srv->video_read_fd = sp[0];
+    sp[0] = INVALID_SOCKFD; /* prevent cleanup from closing read end */
     srv->video_write_fd = sp[1];
-    srv->reader_running = &reader.running;
+    sp[1] = INVALID_SOCKFD; /* prevent cleanup from closing write end */
+    srv->reader = reader;
+    reader = NULL; /* prevent cleanup from freeing */
+    srv->reader_thread = reader_thread;
+    reader_thread = NULL; /* prevent cleanup from closing handle */
+    srv->reader_running = &((adb_reader_t *)srv->reader)->running;
 
     srv->running = true;
     log_info("Server started successfully");
-    return true;
+    result = true;
+
+cleanup:
+    if (!result) {
+        /* Stop reader thread if it was started */
+        if (reader) {
+            reader->running = 0;
+        }
+        if (reader_thread) {
+            WaitForSingleObject(reader_thread, 3000);
+            CloseHandle(reader_thread);
+        }
+        if (ctrl_sender) {
+            WaitForSingleObject(ctrl_sender, 3000);
+            CloseHandle(ctrl_sender);
+        }
+        /* Free reader struct (after thread has stopped) */
+        if (reader) {
+            DeleteCriticalSection(&reader->send_lock);
+            free(reader);
+        }
+        /* Close socketpairs */
+        if (sp[0] != INVALID_SOCKFD) CLOSESOCKET(sp[0]);
+        if (sp[1] != INVALID_SOCKFD) CLOSESOCKET(sp[1]);
+        if (audio_sp[0] != INVALID_SOCKFD) CLOSESOCKET(audio_sp[0]);
+        if (audio_sp[1] != INVALID_SOCKFD) CLOSESOCKET(audio_sp[1]);
+        if (ctrl_sp[0] != INVALID_SOCKFD) CLOSESOCKET(ctrl_sp[0]);
+        if (ctrl_sp[1] != INVALID_SOCKFD) CLOSESOCKET(ctrl_sp[1]);
+        /* Close channels */
+        if (conn) {
+            if (ctrl_chan) session_close_channel(conn, ctrl_chan);
+            if (audio_chan) session_close_channel(conn, audio_chan);
+            if (video_chan) session_close_channel(conn, video_chan);
+            if (sync_chan) session_close_channel(conn, sync_chan);
+            adb_disconnect(conn);
+        }
+        /* Close file handle */
+        if (fp) fclose(fp);
+    }
+    return result;
 }
 
 void server_kill(server_t *srv) {
@@ -778,6 +666,12 @@ void server_destroy(server_t *srv) {
         WaitForSingleObject(srv->reader_thread, 3000);
         CloseHandle(srv->reader_thread);
         srv->reader_thread = NULL;
+    }
+    /* Free heap-allocated reader struct */
+    if (srv->reader) {
+        DeleteCriticalSection(&((adb_reader_t *)srv->reader)->send_lock);
+        free(srv->reader);
+        srv->reader = NULL;
     }
     /* Close write-end socket (reader thread's socket) */
     if (srv->video_write_fd != INVALID_SOCKFD) {
