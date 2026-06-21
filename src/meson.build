@@ -78,6 +78,43 @@ app_src = files(
     'app/config.c',
 )
 
+# Script sources
+script_src = files(
+    'script/message_queue.c',
+    'script/engine.c',
+    'script/event_dispatch.c',
+    'script/repl_window.c',
+    'script/bindings.c',
+)
+
+# Copy Chez Scheme boot files and init.ss to build directory (uses Python to avoid sandbox)
+chez_boot_dir = meson.current_source_dir() / '..' / 'subprojects' / 'chez-scheme' / 'boot' / 'pb'
+custom_target('chez-init-ss',
+    output: 'init.ss',
+    command: [find_program('python', 'python3'), '-c',
+              'import shutil, sys, os; os.makedirs(os.path.dirname(sys.argv[2]), exist_ok=True); shutil.copy2(sys.argv[1], sys.argv[2])',
+              meson.current_source_dir() / '..' / 'lib' / 'init.ss', '@OUTPUT@'],
+    build_by_default: true,
+)
+custom_target('chez-scheme-boot',
+    output: 'scheme.boot',
+    command: [find_program('python', 'python3'), '-c',
+              'import shutil, sys; shutil.copy2(sys.argv[1], sys.argv[2])',
+              chez_boot_dir / 'scheme.boot', '@OUTPUT@'],
+    build_by_default: true,
+    install: true,
+    install_dir: get_option('bindir'),
+)
+custom_target('chez-petite-boot',
+    output: 'petite.boot',
+    command: [find_program('python', 'python3'), '-c',
+              'import shutil, sys; shutil.copy2(sys.argv[1], sys.argv[2])',
+              chez_boot_dir / 'petite.boot', '@OUTPUT@'],
+    build_by_default: true,
+    install: true,
+    install_dir: get_option('bindir'),
+)
+
 # Main executable
 executable('autoscrcpy',
     'main.c',
@@ -92,6 +129,7 @@ executable('autoscrcpy',
     audio_src,
     pipeline_src,
     app_src,
-    dependencies: [libavcodec_dep, libavformat_dep, libavutil_dep, libswscale_dep, libswresample_dep, mbedtls_dep] + winlibs,
+    script_src,
+    dependencies: [libavcodec_dep, libavformat_dep, libavutil_dep, libswscale_dep, libswresample_dep, mbedtls_dep] + winlibs + [chez_scheme_dep],
     install: true,
 )

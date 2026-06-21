@@ -218,7 +218,7 @@
   ;; Returns #t if device is connected, #f otherwise
   (let ((info (device-info)))
     (if (and (pair? info) (pair? (cdr info)) (pair? (cddr info)) (pair? (cdddr info)))
-        (not (zero? (cadddr info))) #f)))
+        (cadddr info) #f)))
 
 (define (video-size)
   ;; Returns '(width . height) of video stream or #f

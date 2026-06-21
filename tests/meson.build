@@ -115,3 +115,20 @@ test_device = executable('test_device', 'test_device.c',
     '../src/decode/video_decoder.c',
     dependencies: [mbedtls_dep, libavcodec_dep, libavutil_dep] + winlibs,
 )
+
+test_message_queue = executable('test_message_queue', 'test_message_queue.c',
+    '../src/script/message_queue.c',
+    '../src/platform/log.c',
+    dependencies: winlibs,
+)
+test('Message queue test', test_message_queue)
+
+test_script_engine = executable('test_script_engine', 'test_script_engine.c',
+    '../src/script/message_queue.c',
+    '../src/script/engine.c',
+    '../src/script/bindings.c',
+    '../src/platform/log.c',
+    include_directories: include_directories('../src'),
+    dependencies: [chez_scheme_dep] + winlibs,
+)
+test('Script engine test', test_script_engine)

@@ -98,6 +98,20 @@ bool cli_parse(int argc, char *argv[], struct scrcpy_options *options) {
             }
             options->record = true;
             options->record_filename = argv[++i];
+        } else if (strcmp(argv[i], "--script") == 0) {
+            if (i + 1 >= argc) {
+                log_error("Missing script file path");
+                return false;
+            }
+            options->script_path = argv[++i];
+        } else if (strcmp(argv[i], "-e") == 0 || strcmp(argv[i], "--eval") == 0) {
+            if (i + 1 >= argc) {
+                log_error("Missing expression after -e/--eval");
+                return false;
+            }
+            options->script_eval = argv[++i];
+        } else if (strcmp(argv[i], "--repl") == 0) {
+            options->repl = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: autoscrcpy [options]\n");
             printf("Options:\n");
@@ -117,6 +131,9 @@ bool cli_parse(int argc, char *argv[], struct scrcpy_options *options) {
             printf("  --stay-awake               Keep device awake\n");
             printf("  --show-touches             Show touches\n");
             printf("  -r, --record <file>        Record to file\n");
+            printf("  --script <file>            Load Scheme script on start\n");
+            printf("  -e, --eval <expr>          Evaluate Scheme expression\n");
+            printf("  --repl                     Show Scheme REPL window\n");
             printf("  -h, --help                 Show this help\n");
             return false;
         } else {
