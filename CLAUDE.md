@@ -6,11 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AutoScrcpy 是 scrcpy 的 Windows 原生实现，目标是在 Windows 上完整复现 scrcpy 的全部功能。
 
+### 主要特性
+
+- **视频流** — ADB 连接、H.264 解码、D3D11 渲染
+- **脚本引擎** — 嵌入 Chez Scheme，支持设备自动化、运行时扩展、交互式 REPL
+- **控制输入** — 按键、触摸、滚动、剪贴板（通过脚本或控制器）
+
 ## Hard Constraints (必须遵守)
 
 1. **Win32 + DirectX 11** — 不使用 SDL。窗口管理用 Win32 API，视频渲染用 D3D11。禁止重新引入 SDL 依赖。
 2. **原生 ADB 协议** — 不依赖 adb 二进制。参考 `reference/adb-impl/` 的实现，shell/push/forward 等操作全部用 C 代码实现，直接与设备 adbd 通信，不经过 adb daemon。
-3. **依赖管控** — 构建系统使用 Meson + Ninja + Clang。三方依赖通过 Meson `subprojects/` wrap 管理，目前只允许 FFmpeg 和 mbedtls。引入任何新依赖必须获得用户明确同意。不使用 vcpkg 或其他三方包管理工具。
+3. **依赖管控** — 构建系统使用 Meson + Ninja + Clang。三方依赖通过 Meson `subprojects/` wrap 管理，目前允许 FFmpeg、mbedtls 和 Chez Scheme。引入任何新依赖必须获得用户明确同意。不使用 vcpkg 或其他三方包管理工具。
 4. **模块化设计** — 分层架构，模块间松耦合。遵循开闭原则（对扩展开放、对修改关闭）和单一职责原则。
 5. **reference/ 只读** — `reference/` 下的代码仓仅供查阅参考，禁止修改其内容。
 
@@ -32,7 +38,7 @@ ninja -C builddir
 meson test -C builddir
 ```
 
-覆盖 38 个用例：binary.h、input_transform、keycode_map、control_msg、crypto、protocol、adb 初始化。
+覆盖 93 个用例：binary.h、input_transform、keycode_map、control_msg、crypto、protocol、adb 初始化、消息队列、脚本引擎。
 
 ### Manual Tests (需要设备)
 
@@ -62,6 +68,8 @@ meson test -C builddir
 | `test_crypto.c` | 自动 | 7 | RSA 密钥/签名 |
 | `test_protocol.c` | 自动 | 2 | 协议 checksum |
 | `test_adb.c` | 自动 | 2 | ADB 初始化 |
+| `test_message_queue.c` | 自动 | 6 | 消息队列生命周期/FIFO/溢出 |
+| `test_script_engine.c` | 自动 | 14 | Chez VM/FFI/求值/引擎生命周期 |
 | `test_device.c` | 手动 | 7 | 设备统一入口 |
 
 ## Architecture
@@ -76,6 +84,12 @@ main.c → app/ → device/ → adb/
                decode/    platform/
                   ↓
                render/ (D3D11)
+
+            script/ → (Chez Scheme VM)
+               ↓
+          message_queue
+               ↓
+         device/ control/
 ```
 
 ### Module Summary
@@ -91,6 +105,7 @@ main.c → app/ → device/ → adb/
 | `src/control/` | Control message serialization (`control_msg.c`) and a threaded sender (`controller.c`) with a lock-free queue. Also `clipboard.c` and `power.c`. |
 | `src/audio/` | WASAPI audio playback (`player.c`) with a timing regulator (`regulator.c`). |
 | `src/record/` | Recording via FFmpeg muxer: `recorder.c` orchestrates, `muxer.c` writes MP4/MKV containers. |
+| `src/script/` | Chez Scheme 脚本引擎: 独立线程运行 Chez VM，消息队列与主线程通信，FFI 绑定暴露设备操作，REPL 浮动窗口。 |
 | `src/app/` | Application lifecycle (`application.c`), Win32 window management (`window.c`), CLI parsing (`cli.c`), option defaults (`options.c`). |
 
 ### Key Data Flow
@@ -118,11 +133,12 @@ Video stream data format (bytes sent on the ADB channel):
 
 ### Threading Model
 
-- **Main thread**: Win32 message loop + D3D11 rendering (PeekMessage idle pattern from reference/d3d_video MessageLoop)
+- **Main thread**: Win32 message loop + D3D11 rendering (PeekMessage idle pattern from reference/d3d_video MessageLoop). Also processes script engine messages.
 - **ADB reader thread**: reads ADB messages from device, sends OKAY flow control, writes video data to socketpair
 - **Video thread**: reads H.264 from socketpair, decodes via FFmpeg, writes NV12 frames to `shared_frame` via `InterlockedExchangePointer` (no D3D operations)
 - **Audio thread**: reads from audio socket, decodes, writes to audio player (currently disabled)
 - **Controller thread**: drains control message queue, sends to device (currently disabled)
+- **Script thread**: runs Chez Scheme VM, receives events from main thread via message queue, sends commands/queries back to main thread
 
 **Important**: D3D11 device is created on the main thread (same thread as the Win32 window — DXGI requirement). D3D11 multi-threaded protection is enabled via `ID3D10Multithread::SetMultithreadProtected(TRUE)` as a safety net.
 
@@ -134,8 +150,9 @@ Video stream data format (bytes sent on the ADB channel):
 |------------|---------|------|
 | FFmpeg | Video/audio decoding and recording mux | `subprojects/ffmpeg.wrap` (meson-7.1 branch) |
 | mbedtls | TLS for ADB AUTH handshake | `subprojects/mbedtls.wrap` (v3.6.2) |
+| Chez Scheme | Embedded scripting engine | `subprojects/chez-scheme.wrap` (v10.1.0) |
 
-Win32 system libraries linked directly: d3d11, dxgi, user32, kernel32, gdi32, ws2_32, imm32, bcrypt, mmdevapi, uuid, ole32, oleaut32.
+Win32 system libraries linked directly: d3d11, dxgi, user32, kernel32, gdi32, ws2_32, imm32, bcrypt, mmdevapi, uuid, ole32, oleaut32, rpcrt4, comctl32.
 
 ## Coding Conventions
 
@@ -169,17 +186,175 @@ Video streaming fully working - ADB connection, H.264 decoding, D3D11 rendering,
 - ✅ Aspect ratio correction (letterbox/pillarbox via vertex transform matrix)
 - ✅ Window resize → D3D resize + aspect ratio update
 - ✅ Main-thread rendering with PeekMessage idle loop (reference MessageLoop pattern)
+- ✅ Chez Scheme scripting engine (embedded, static link, FFI bindings)
+- ✅ Script control commands (keycode, touch, scroll, clipboard, power, rotation)
+- ✅ Script device queries (dimensions, connection status, frame capture, clipboard)
+- ✅ Script event callbacks (key, mouse, frame, connect/disconnect)
+- ✅ REPL floating window (Win32, history, syntax)
+- ✅ CLI options: `--script`, `--eval`, `--repl`
+- ✅ Config file: `[script]` section
 
 ### Not Yet Working
 - ❌ Audio streaming (server started with `audio=false`)
-- ❌ Control input (server started with `control=false`)
 - ❌ Recording
-- ❌ Clipboard sync
+- ❌ Clipboard sync (device clipboard read via control socket)
 
 ### Known Issues
 - H.264 `No start code is found` errors — raw `recv()` chunks may not align with NAL boundaries; decoder self-recovers
 - H.264 P-frame `concealing errors` — caused by initial data misalignment or socketpair buffer overflow
 - First few frames may have artifacts until decoder accumulates reference frames (SPS/PPS)
+
+## Scripting Engine
+
+AutoScrcpy 嵌入了 Chez Scheme 作为脚本引擎，支持设备自动化、运行时扩展和交互式 REPL。
+
+### 使用方式
+
+```bash
+# 启动并加载脚本
+./autoscrcpy --script automation.scm
+
+# 启动并打开 REPL
+./autoscrcpy --repl
+
+# 执行单个表达式
+./autoscrcpy -e '(display "Hello from Scheme\n")'
+
+# 脚本 + REPL
+./autoscrcpy --script test.scm --repl
+```
+
+### 配置文件
+
+```ini
+[script]
+script_dir=./scripts    ; 脚本目录（预留）
+autoload=init.scm       ; 启动时自动加载的脚本
+repl=false              ; 是否自动打开 REPL
+```
+
+### Scheme API
+
+```scheme
+;; 控制命令
+(inject-keycode 'home #t)       ;; 按键（支持符号或整数）
+(inject-text "Hello World")     ;; 文本输入
+(inject-touch 500 800 'down)    ;; 触摸（'down/'up/'move）
+(inject-scroll 500 800 0 -3)   ;; 滚动
+(set-clipboard "text")          ;; 设置剪贴板
+(expand-notification)           ;; 展开通知栏
+(collapse-panels)               ;; 收起面板
+(set-display-power #t)          ;; 开关屏幕
+(rotate-device)                 ;; 旋转设备
+(start-app "com.android.settings") ;; 启动应用
+
+;; 设备查询（同步，阻塞等待响应）
+(device-width)                  ;; 屏幕宽度
+(device-height)                 ;; 屏幕高度
+(device-name)                   ;; 设备名称
+(is-connected?)                 ;; 是否连接
+(video-size)                    ;; 视频尺寸 '(width . height)
+(window-size)                   ;; 窗口尺寸 '(width . height)
+(get-clipboard)                 ;; 剪贴板内容
+(capture-frame)                 ;; NV12 帧数据 bytevector
+
+;; 事件回调
+(on-key (lambda (vk down?) ...))
+(on-mouse (lambda (x y buttons action) ...))
+(on-frame (lambda (w h) ...))
+(on-connect (lambda () ...))
+(on-disconnect (lambda () ...))
+
+;; 便捷操作
+(press-key 'home)               ;; 完整按键（按下+抬起）
+(tap 500 800)                   ;; 点击
+(long-press 500 800 1000)       ;; 长按
+(swipe 100 500 900 500 300 10) ;; 滑动
+
+;; 工具
+(sleep-ms 1000)                 ;; 延迟
+(log-info "message")            ;; 日志
+(load-script "path/to/file.scm") ;; 加载脚本
+```
+
+### 按键符号映射
+
+```scheme
+;; 导航键
+'home → 3    'back → 4    'power → 26   'menu → 82
+'volume-up → 24  'volume-down → 25
+'enter → 66  'tab → 61    'space → 62
+
+;; 字母 a-z → 29-54
+;; 数字 0-9 → 7-16
+;; 功能键 F1-F12 → 131-142
+```
+
+### 脚本示例
+
+```scheme
+;; automation.scm — 自动化脚本示例
+
+;; 连接时自动执行
+(on-connect (lambda ()
+  (log-info "Device connected!")
+  (format #t "Screen: ~ax~a~%" (device-width) (device-height))))
+
+;; 按键事件监听
+(on-key (lambda (vk down?)
+  (when (and (eq? vk 'f5) down?)
+    (log-info "F5 pressed, capturing frame...")
+    (let ((frame (capture-frame)))
+      (when frame
+        (format #t "Captured ~a bytes~%" (bytevector-length frame)))))))
+
+;; 自动化序列
+(define (auto-test)
+  (press-key 'home)
+  (sleep-ms 1000)
+  (tap 540 960)
+  (sleep-ms 500)
+  (inject-text "Hello from Scheme!")
+  (press-key 'enter))
+
+(display "Automation script loaded.\n")
+```
+
+### 架构
+
+```
+Scheme 线程                    主线程
+    │                             │
+    │  ┌─ to_main queue ─────────▶│ 控制命令执行
+    │  │                          │
+    │  │◀── to_scheme queue ─────│ 事件通知
+    │  │                          │
+    │  └── response_q ──────────▶│ 查询响应
+    │◀────────────────────────────┘
+    │
+    └─ Chez VM: eval, load, FFI
+```
+
+### 文件结构
+
+```
+src/script/
+├── engine.h/c          # Chez VM 生命周期
+├── bindings.h/c        # C→Scheme FFI 绑定（17 个符号）
+├── message_queue.h/c   # 线程安全消息队列
+├── event_dispatch.h/c  # 事件分发
+├── repl_window.h/c     # REPL 浮动窗口
+└── script_api.h        # 统一头文件
+
+lib/
+└── init.ss             # Scheme 运行时库
+
+subprojects/chez-scheme/
+├── boot/pb/            # 预生成的 boot 文件
+├── c/                  # C 内核源码（32 个文件）
+├── zlib/               # 捆绑的 zlib
+└── lz4/lib/            # 捆绑的 lz4
+```
 
 ## Reference Code
 
