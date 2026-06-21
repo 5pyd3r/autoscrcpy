@@ -20,6 +20,8 @@ libavutil_dep = dependency('libavutil', required: true)
 libswscale_dep = dependency('libswscale', required: true)
 libswresample_dep = dependency('libswresample', required: true)
 mbedtls_dep = dependency('mbedtls', required: true)
+chez_scheme_dep = dependency('chez-scheme', required: false,
+    fallback: ['chez-scheme', 'chez_scheme_dep'])
 
 # Windows libraries
 winlibs = []
@@ -37,7 +39,9 @@ if host_machine.system() == 'windows'
         cc.find_library('imm32'),
         cc.find_library('bcrypt'),
         cc.find_library('uuid'),
+        cc.find_library('rpcrt4'),
         cc.find_library('mmdevapi'),
+        cc.find_library('comctl32'),
     ]
 endif
 

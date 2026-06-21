@@ -1,0 +1,2 @@
+option('chez_dir', type: 'string', value: '',
+    description: 'Path to pre-built Chez Scheme installation (contains include/, lib/, boot/ subdirectories). If empty, uses subprojects/chez-scheme/prebuilt/')
