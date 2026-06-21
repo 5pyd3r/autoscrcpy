@@ -2,6 +2,8 @@
 #include "../platform/log.h"
 #include "../adb/adb.h"
 #include "../device/server.h"
+#include "../script/event_dispatch.h"
+#include "../script/bindings.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -11,6 +13,13 @@ static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons,
                             uint32_t action, void *userdata);
 static void on_wheel_event(int32_t x, int32_t y, int32_t delta, void *userdata);
 static void on_resize(int32_t width, int32_t height, void *userdata);
+
+/* Script query callbacks */
+static void on_script_query_device_info(script_engine_t *engine, void *ctx);
+static void on_script_query_video_size(script_engine_t *engine, void *ctx);
+static void on_script_query_window_size(script_engine_t *engine, void *ctx);
+static void on_script_query_clipboard(script_engine_t *engine, void *ctx);
+static void on_script_query_frame_capture(script_engine_t *engine, void *ctx);
 
 bool application_init(application_t *app, const struct scrcpy_options *options) {
     app->options = *options;
@@ -79,6 +88,22 @@ bool application_init(application_t *app, const struct scrcpy_options *options) 
     app->video_sock.fd = INVALID_SOCKFD;
     app->audio_sock.fd = INVALID_SOCKFD;
     app->control_sock.fd = INVALID_SOCKFD;
+
+    /* Initialize script engine */
+    app->script_enabled = (options->script_path || options->script_eval || options->repl);
+    if (app->script_enabled) {
+        if (!script_engine_init(&app->script_engine, options->script_path,
+                                options->script_eval, NULL, NULL)) {
+            log_warn("Script engine init failed, scripting disabled");
+            app->script_enabled = false;
+        } else {
+            repl_window_init(&app->repl_window, GetModuleHandle(NULL), NULL, NULL);
+            if (options->repl) {
+                repl_window_show(&app->repl_window);
+            }
+        }
+    }
+
     return true;
 }
 
@@ -149,6 +174,11 @@ int application_run(application_t *app) {
     window_show(&app->window);
     app->running = true;
 
+    /* Start script engine */
+    if (app->script_enabled) {
+        script_engine_start(&app->script_engine);
+    }
+
     /* Start pipelines */
     if (app->options.video)
         video_pipeline_start(&app->video_pipeline);
@@ -166,6 +196,10 @@ int application_run(application_t *app) {
     while (app->running) {
         BOOL hasMsg = PeekMessage(&msg, NULL, 0, 0, PM_REMOVE);
         if (hasMsg) {
+            /* Let REPL window handle its messages first */
+            if (app->script_enabled && repl_window_process_message(&app->repl_window, &msg)) {
+                continue;
+            }
             if (msg.message == WM_QUIT) break;
             TranslateMessage(&msg);
             DispatchMessage(&msg);
@@ -216,9 +250,28 @@ int application_run(application_t *app) {
             } else {
                 Sleep(1);
             }
+
+            /* Process script engine messages */
+            if (app->script_enabled) {
+                script_process_messages(&app->script_engine,
+                    /* Command callbacks */
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                    /* Query callbacks */
+                    on_script_query_device_info,
+                    on_script_query_video_size,
+                    on_script_query_window_size,
+                    on_script_query_clipboard,
+                    on_script_query_frame_capture,
+                    app);
+            }
         }
     }
     server_kill(&app->server);
+
+    /* Stop script engine */
+    if (app->script_enabled) {
+        script_engine_stop(&app->script_engine);
+    }
 
     /* Stop pipelines (graceful shutdown with socket close) */
     video_pipeline_stop(&app->video_pipeline);
@@ -229,6 +282,10 @@ int application_run(application_t *app) {
 }
 
 void application_destroy(application_t *app) {
+    if (app->script_enabled) {
+        script_engine_destroy(&app->script_engine);
+        repl_window_destroy(&app->repl_window);
+    }
     video_pipeline_destroy(&app->video_pipeline);
     audio_pipeline_destroy(&app->audio_pipeline);
     if (app->video_decoder) { video_decoder_destroy(app->video_decoder); app->video_decoder = NULL; }
@@ -287,6 +344,10 @@ static void application_resize_window_for_video(application_t *app,
 static void on_key_event(uint32_t vk, bool down, void *userdata) {
     application_t *app = (application_t *)userdata;
     controller_on_key_event(&app->controller, vk, down);
+    /* Dispatch to script engine */
+    if (app->script_enabled) {
+        script_dispatch_key_event(&app->script_engine, vk, down);
+    }
 }
 
 static void on_mouse_event(int32_t x, int32_t y, uint32_t buttons,
@@ -307,4 +368,57 @@ static void on_resize(int32_t width, int32_t height, void *userdata) {
         video_renderer_set_window_size(&app->renderer, (uint32_t)width, (uint32_t)height);
         controller_set_window_size(&app->controller, (uint32_t)width, (uint32_t)height);
     }
+}
+
+/* Script query callbacks — called from main thread, send response to script engine */
+
+static void on_script_query_device_info(script_engine_t *engine, void *ctx) {
+    application_t *app = (application_t *)ctx;
+    script_msg_t resp;
+    script_fill_device_info(&resp, app->device_width, app->device_height,
+                            "Android Device", /* TODO: get real device name */
+                            app->video_sock.fd != INVALID_SOCKFD);
+    script_msg_queue_send(&engine->response_q, &resp);
+}
+
+static void on_script_query_video_size(script_engine_t *engine, void *ctx) {
+    application_t *app = (application_t *)ctx;
+    script_msg_t resp;
+    script_fill_video_size(&resp, app->device_width, app->device_height);
+    script_msg_queue_send(&engine->response_q, &resp);
+}
+
+static void on_script_query_window_size(script_engine_t *engine, void *ctx) {
+    application_t *app = (application_t *)ctx;
+    RECT client;
+    GetClientRect(app->window.hwnd, &client);
+    script_msg_t resp;
+    script_fill_window_size(&resp, client.right - client.left, client.bottom - client.top);
+    script_msg_queue_send(&engine->response_q, &resp);
+}
+
+static void on_script_query_clipboard(script_engine_t *engine, void *ctx) {
+    (void)ctx;
+    script_msg_t resp;
+    /* TODO: read device clipboard via control socket */
+    script_fill_clipboard(&resp, "");
+    script_msg_queue_send(&engine->response_q, &resp);
+}
+
+static void on_script_query_frame_capture(script_engine_t *engine, void *ctx) {
+    application_t *app = (application_t *)ctx;
+    script_msg_t resp;
+
+    frame_data_t *fd = shared_frame_acquire(&app->shared_frame);
+    if (fd && fd->data && fd->width > 0 && fd->height > 0) {
+        /* NV12 size = width * height * 3/2 */
+        uint32_t nv12_size = fd->width * fd->height * 3 / 2;
+        script_fill_frame_capture(&resp, fd->data, fd->width, fd->height, nv12_size);
+        frame_data_free(fd);
+    } else {
+        script_fill_frame_capture(&resp, NULL, 0, 0, 0);
+        if (fd) frame_data_free(fd);
+    }
+
+    script_msg_queue_send(&engine->response_q, &resp);
 }

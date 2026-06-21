@@ -26,4 +26,9 @@ const struct scrcpy_options scrcpy_options_default = {
     .window_width = 0,
     .window_height = 0,
     .log_level = 2,  /* LOG_LEVEL_INFO */
+
+    /* Script engine defaults */
+    .script_path = NULL,
+    .script_eval = NULL,
+    .repl = false,
 };

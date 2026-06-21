@@ -16,6 +16,8 @@
 #include "../pipeline/video_pipeline.h"
 #include "../pipeline/audio_pipeline.h"
 #include "../control/controller.h"
+#include "../script/script_api.h"
+#include "../script/repl_window.h"
 #include <stdbool.h>
 
 typedef struct {
@@ -37,6 +39,9 @@ typedef struct {
     uint32_t device_width;
     uint32_t device_height;
     shared_frame_t shared_frame;
+    script_engine_t script_engine;
+    repl_window_t repl_window;
+    bool script_enabled;
 } application_t;
 
 bool application_init(application_t *app, const struct scrcpy_options *options);

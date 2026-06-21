@@ -30,6 +30,11 @@ struct scrcpy_options {
     uint32_t window_width;       /* initial window width (0 = auto) */
     uint32_t window_height;      /* initial window height (0 = auto) */
     int log_level;               /* LOG_LEVEL_DEBUG/INFO/WARN/ERROR */
+
+    /* Script engine options */
+    const char *script_path;     /* --script: startup script file */
+    const char *script_eval;     /* -e/--eval: expression to evaluate */
+    bool repl;                   /* --repl: show REPL window on start */
 };
 
 extern const struct scrcpy_options scrcpy_options_default;

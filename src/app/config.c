@@ -138,6 +138,20 @@ static void apply_setting(const char *section, const char *key,
         return;
     }
 
+    /* [script] */
+    if (strcmp(section, "script") == 0) {
+        if (strcmp(key, "script_dir") == 0) {
+            /* Reserved for future use */
+        } else if (strcmp(key, "autoload") == 0) {
+            options->script_path = _strdup(value);
+        } else if (strcmp(key, "repl") == 0) {
+            options->repl = parse_bool(value);
+        } else {
+            log_warn("Unknown key '%s' in [script]", key);
+        }
+        return;
+    }
+
     /* [log] */
     if (strcmp(section, "log") == 0) {
         if (strcmp(key, "level") == 0) {
@@ -208,6 +222,7 @@ bool config_parse(const char *path, struct scrcpy_options *options) {
             strcmp(section, "window") != 0 &&
             strcmp(section, "device") != 0 &&
             strcmp(section, "record") != 0 &&
+            strcmp(section, "script") != 0 &&
             strcmp(section, "log") != 0) {
             log_warn("Config line %d: unknown section '[%s]'", line_num, section);
             continue;
