@@ -24,6 +24,12 @@ struct scrcpy_options {
     bool stay_awake;
     bool show_touches;
     bool record;
+
+    /* New fields for config file support */
+    const char *audio_source;    /* "output" or "mic" */
+    uint32_t window_width;       /* initial window width (0 = auto) */
+    uint32_t window_height;      /* initial window height (0 = auto) */
+    int log_level;               /* LOG_LEVEL_DEBUG/INFO/WARN/ERROR */
 };
 
 extern const struct scrcpy_options scrcpy_options_default;

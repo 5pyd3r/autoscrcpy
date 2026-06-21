@@ -20,4 +20,10 @@ const struct scrcpy_options scrcpy_options_default = {
     .stay_awake = false,
     .show_touches = false,
     .record = false,
+
+    /* New defaults */
+    .audio_source = "output",
+    .window_width = 0,
+    .window_height = 0,
+    .log_level = 2,  /* LOG_LEVEL_INFO */
 };
