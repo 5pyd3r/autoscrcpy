@@ -19,6 +19,7 @@ build/
 # Subprojects
 subprojects/*/
 !subprojects/*.wrap
+!subprojects/packagefiles/
 
 # Log files
 runlog.txt

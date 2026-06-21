@@ -2,6 +2,7 @@
 url = https://github.com/Mbed-TLS/mbedtls.git
 revision = v3.6.2
 depth = 1
+patch_directory = mbedtls
 
 [provide]
 mbedtls = mbedtls_dep
